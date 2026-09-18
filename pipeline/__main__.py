@@ -57,7 +57,8 @@ def _verify(args) -> int:
     from pipeline.exporting import ExportError
 
     try:
-        summary = verify_module.run(Path(args.out), args.backend, Path(args.work))
+        gate = Path(args.gate) if args.gate else None
+        summary = verify_module.run(Path(args.out), args.backend, Path(args.work), gate_reference=gate)
     except ExportError as error:
         print(f"verify failed: {error}", file=sys.stderr)
         return 2
@@ -221,6 +222,11 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("out")
     verify.add_argument("--backend", default="xnnpack")
     verify.add_argument("--work", default="verify-work")
+    verify.add_argument(
+        "--gate",
+        default=None,
+        help="gate.json from `solve`: the file must decide like the fp32 model before it publishes",
+    )
     verify.set_defaults(func=_verify)
 
     solve = commands.add_parser("solve", help="GPTQ the int4 codes once per model, for every window to reuse")

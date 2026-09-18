@@ -326,7 +326,7 @@ def run(model_id: str, revision: str, out: Path, work_dir: Path, damp: float = 0
     """
     import torch
 
-    from pipeline import calibration, convert, eligibility, families, hub, settings
+    from pipeline import calibration, convert, eligibility, families, gate, hub, settings
     from pipeline.exporting import ExportError
 
     cfg = settings.load()
@@ -356,6 +356,13 @@ def run(model_id: str, revision: str, out: Path, work_dir: Path, damp: float = 0
     tokenizer = AutoTokenizer.from_pretrained(str(src_dir))
     fp32, generate = teacher(src_dir)
     rows = calibration.sequences(generate, tokenizer)
+    # While the unquantised model is still loaded: what it would decide on the gate's
+    # prompts, which is what the exported file has to agree with before anything publishes.
+    print("==> gate reference")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    reference = gate.reference(fp32, tokenizer)
+    (out.parent / "gate.json").write_text(json.dumps(reference, indent=2) + "\n", encoding="utf-8")
+    print(f"    fp32 is confident on {reference['confident']} of {len(reference['rows'])} gate rows")
     del fp32, generate
     gc.collect()
 
@@ -378,4 +385,6 @@ def run(model_id: str, revision: str, out: Path, work_dir: Path, damp: float = 0
         "calibration_app_rows": len(calibration.SEARCH_ROWS) + len(calibration.KNOWN_ROWS),
         "seconds": round(seconds, 1),
         "damp": damp,
+        "gate_rows": len(reference["rows"]),
+        "gate_confident_rows": reference["confident"],
     }

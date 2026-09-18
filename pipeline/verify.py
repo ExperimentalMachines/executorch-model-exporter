@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pipeline import families, hub, settings, smoke
+from pipeline import families, gate, hub, settings, smoke
 from pipeline.exporting import ExportError
 
 
@@ -30,9 +30,10 @@ def reports(out_dir: Path, backend: str) -> list[Path]:
     return found
 
 
-def run(out_dir: Path, backend: str, work_dir: Path) -> dict:
+def run(out_dir: Path, backend: str, work_dir: Path, gate_reference: Path | None = None) -> dict:
     """Run the smoke test for every window in ``out_dir`` and write the results back."""
     results = []
+    gates: list[dict] = []
     for path in reports(out_dir, backend):
         report = json.loads(path.read_text())
         if report.get("smoke") is not None:
@@ -65,6 +66,24 @@ def run(out_dir: Path, backend: str, work_dir: Path) -> dict:
         )
         print(f"    reply: {result['reply']!r}")
         report["smoke"] = result
+
+        # Generating is not the same as deciding. A file can answer the smoke question and
+        # still have lost the tool call that made it worth exporting, which is what happened
+        # on 2026-09-18 and is why this is here rather than left to a person to notice.
+        if result.get("passed") and gate_reference is not None:
+            from transformers import AutoTokenizer
+
+            reference = json.loads(gate_reference.read_text())
+            tokenizer = AutoTokenizer.from_pretrained(str(src_dir))
+            print("==> decision gate")
+            verdict = gate.check(reference, gate.measure(pte, out_dir / report["tokenizer"], tokenizer, reference))
+            print(
+                f"    fp32 {verdict['fp32_mean']} against the export's {verdict['export_mean']} "
+                f"on {verdict['graded']} rows, same choice on {verdict['agreed']}"
+            )
+            report["gate"] = verdict
+            gates.append(verdict)
+
         path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         results.append(result)
 
@@ -72,7 +91,11 @@ def run(out_dir: Path, backend: str, work_dir: Path) -> dict:
     if failed:
         problems = "; ".join(p for r in failed for p in r.get("problems", []))
         raise ExportError(f"smoke test failed: {problems}")
-    return {"windows": len(results), "passed": True}
+    regressed = [g for g in gates if not g.get("passed")]
+    if regressed:
+        problems = "; ".join(p for g in regressed for p in g.get("problems", []))
+        raise ExportError(f"decision gate failed: {problems}")
+    return {"windows": len(results), "passed": True, "gated": len(gates)}
 
 
 def main(out_dir: Path, backend: str, work_dir: Path) -> int:
