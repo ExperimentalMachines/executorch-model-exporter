@@ -1,6 +1,7 @@
-"""Run ``export_llm`` with solved int4 codes in place of its own rounding.
+"""Run ``export_llm`` with the graph fixes a published file needs, and optionally with
+solved int4 codes in place of its own rounding.
 
-    python -m pipeline.export_with_codes --config <export_llm.yaml> --codes <codes.pt>
+    python -m pipeline.export_with_codes --config <export_llm.yaml> [--codes <codes.pt>] [--lfm2-state-fix]
 
 A separate entry point, invoked as a subprocess like plain ``export_llm``, so the exporter
 keeps measuring a child's peak RSS and an out-of-memory export still fails as a process
@@ -60,25 +61,38 @@ def inject(model, codes: dict, log=print) -> tuple[int, list[str]]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="the export_llm YAML the exporter wrote")
-    parser.add_argument("--codes", required=True, help="codes.pt from the solve stage")
+    parser.add_argument("--codes", help="codes.pt from the solve stage; without it the export rounds as usual")
+    parser.add_argument(
+        "--lfm2-state-fix",
+        action="store_true",
+        help="clear the short convolution's state at position zero (pipeline/lfm2_state.py)",
+    )
     args = parser.parse_args(argv)
 
     import torch
-    from executorch.examples.models.llama.source_transformation import quantize as quantize_module
 
-    # weights_only: the codes file is an artifact passed between CI jobs, and it holds
-    # nothing but tensors, so there is no reason to let it unpickle arbitrary objects.
-    codes = torch.load(args.codes, map_location="cpu", weights_only=True)
-    upstream = quantize_module.quantize
+    if args.lfm2_state_fix:
+        from pipeline import lfm2_state
 
-    def quantize(model, qmode, *rest, **kwargs):
-        quantised = upstream(model, qmode, *rest, **kwargs)
-        if qmode != "8da4w":
+        lfm2_state.apply()
+        print("applied the LFM2 short-convolution state fix")
+
+    if args.codes:
+        from executorch.examples.models.llama.source_transformation import quantize as quantize_module
+
+        # weights_only: the codes file is an artifact passed between CI jobs, and it holds
+        # nothing but tensors, so there is no reason to let it unpickle arbitrary objects.
+        codes = torch.load(args.codes, map_location="cpu", weights_only=True)
+        upstream = quantize_module.quantize
+
+        def quantize(model, qmode, *rest, **kwargs):
+            quantised = upstream(model, qmode, *rest, **kwargs)
+            if qmode != "8da4w":
+                return quantised
+            inject(quantised, codes)
             return quantised
-        inject(quantised, codes)
-        return quantised
 
-    quantize_module.quantize = quantize
+        quantize_module.quantize = quantize
 
     from executorch.extension.llm.export.export_llm import main as export_llm_main
 

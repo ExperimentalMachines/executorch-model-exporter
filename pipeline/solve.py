@@ -148,6 +148,14 @@ def eager_model(model_class: str, params: dict, checkpoint: Path, work_dir: Path
     from executorch.examples.models.llama.model import Llama2Model
     from executorch.extension.llm.export.config.llm_config import LlmConfig, ModelType
 
+    if model_class.startswith("lfm2"):
+        # Without this every calibration row would start on the previous row's convolution
+        # state, so each Hessian would be taken from inputs no real prompt ever produces.
+        # The exported graph carries the same fix, so the solve matches what ships.
+        from pipeline import lfm2_state
+
+        lfm2_state.apply()
+
     params_path = work_dir / "solve-params.json"
     params_path.write_text(json.dumps(params))
     cfg = LlmConfig()
