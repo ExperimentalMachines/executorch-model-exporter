@@ -73,9 +73,10 @@ jobs:
     # artifact, which is why it is worth a job of its own.
     needs: targets
     if: ${{ inputs.gptq }}
-    # Sized on memory like the export: it holds the fp32 model and one layer's Hessians.
-    # On x86 with the export, so the solve and the file it feeds are built the same way.
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # ARM like the export: the solve works on the eager PyTorch module and never loads the
+    # C++ runner, which is the only thing aarch64 cannot do (finding 30).
+    # Sized on memory: it holds the fp32 model and one layer's Hessians.
+    runs-on: blacksmith-8vcpu-ubuntu-2404-arm
     timeout-minutes: 350
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -110,15 +111,11 @@ jobs:
       fail-fast: false
       matrix:
         context: ${{ fromJSON(needs.targets.outputs.contexts) }}
-    # Sized on memory, not cores: 32 GB, because the causal masks grow with the window
-    # squared and have killed a 32k export before (docs/research findings 2 and 28). The
-    # CPU knee is not yet measured.
-    # Exports stay on x86 until the runner works on aarch64. The toolchain is arm64-clean and
-    # the export itself succeeded there, but the wheel's C++ TextLLMRunner raises
-    # `IndexError: stoi` on ARM, and that runner is the smoke test: without it a published
-    # file drops from "generated text and answered" to "the methods exist", which is the
-    # standard the QNN and MediaTek programs were withdrawn for (findings 28, 30).
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    # ARM: the export is arm64-clean, and it is the long half of the job. What does not work
+    # there is the runner, so the smoke test is a separate job on x86 (finding 30).
+    # Sized on memory, not cores: 24 GB, because the causal masks grow with the window
+    # squared and have killed a 32k export before (findings 2 and 28).
+    runs-on: blacksmith-8vcpu-ubuntu-2404-arm
     timeout-minutes: 350
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -141,14 +138,14 @@ jobs:
 
       # Exit 4 means this runner cannot build this window (memory grows with the square of
       # the window): recorded as a skip, so the other windows' jobs stand on their own.
-      - name: Export and smoke-test
+      - name: Export
         run: |
           echo "ARTIFACT=xnnpack-${MODEL_ID//\//--}-${CONTEXT}" >>"$GITHUB_ENV"
           set +e
           CODES=""
           if [ -f "$WORK_DIR/codes.pt" ]; then CODES="--codes $WORK_DIR/codes.pt"; fi
           python -m pipeline export-xnnpack "$MODEL_ID" --revision "$REVISION" --context "$CONTEXT" \
-            --out "$WORK_DIR/out" --work "$WORK_DIR/work" $CODES
+            --out "$WORK_DIR/out" --work "$WORK_DIR/work" $CODES --skip-smoke
           rc=$?
           set -e
           if [ "$rc" -eq 4 ]; then
@@ -172,6 +169,61 @@ jobs:
           path: ${{ env.WORK_DIR }}/out
           retention-days: 14
           if-no-files-found: warn
+
+
+  verify:
+    # The smoke test, and only then the publish. ExecuTorch's runner raises IndexError: stoi
+    # on aarch64 (finding 30), so this is the one job that has to be x86; it loads the .pte
+    # the export built and asks the same question through the same C++ runner the app uses.
+    needs: [targets, export]
+    if: ${{ always() && needs.export.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        context: ${{ fromJSON(needs.targets.outputs.contexts) }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      MODEL_ID: ${{ inputs.model_id }}
+      CONTEXT: ${{ matrix.context }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-export
+        with:
+          swap-gib: "8"
+
+      - name: Name the export's artifact
+        run: echo "ARTIFACT=xnnpack-${MODEL_ID//\//--}-${CONTEXT}" >>"$GITHUB_ENV"
+
+      # A window the export skipped (too wide for its runner) uploads nothing, so this job
+      # stands down instead of failing on a missing artifact.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        id: fetch
+        continue-on-error: true
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ env.WORK_DIR }}/out
+
+      - name: Note a skipped window
+        if: steps.fetch.outcome != 'success'
+        run: |
+          echo "SKIPPED=1" >>"$GITHUB_ENV"
+          echo "::notice title=Nothing to verify::$MODEL_ID at $CONTEXT tokens was not exported"
+
+      - name: Smoke-test the exported file
+        if: env.SKIPPED != '1'
+        run: python -m pipeline verify "$WORK_DIR/out" --backend xnnpack --work "$WORK_DIR/verify-work"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: env.SKIPPED != '1'
+        with:
+          name: verified-${{ env.ARTIFACT }}
+          path: ${{ env.WORK_DIR }}/out
+          retention-days: 14
+          if-no-files-found: error
 
       - name: Publish to Hugging Face
         if: inputs.publish_hf && env.SKIPPED != '1'

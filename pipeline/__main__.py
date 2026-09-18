@@ -50,6 +50,12 @@ def _run_export(export) -> int:
     return 0
 
 
+def _verify(args) -> int:
+    from pipeline import verify as verify_module
+
+    return _run_export(lambda: verify_module.run(Path(args.out), args.backend, Path(args.work)))
+
+
 def _solve(args) -> int:
     from pipeline import solve as solve_module
 
@@ -201,6 +207,12 @@ def main(argv: list[str] | None = None) -> int:
         help="codes.pt from `solve`; without it the int4 weights are rounded to nearest",
     )
     export.set_defaults(func=_export_xnnpack)
+
+    verify = commands.add_parser("verify", help="smoke-test an exported .pte on a host whose runner works")
+    verify.add_argument("out")
+    verify.add_argument("--backend", default="xnnpack")
+    verify.add_argument("--work", default="verify-work")
+    verify.set_defaults(func=_verify)
 
     solve = commands.add_parser("solve", help="GPTQ the int4 codes once per model, for every window to reuse")
     solve.add_argument("model")
