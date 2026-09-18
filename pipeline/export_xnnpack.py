@@ -154,7 +154,11 @@ def run(
 
     recipe = cfg.xnnpack if backend == "xnnpack" else cfg.vulkan
     output_repo = naming.output_repo(model_id, cfg.hub_org, cfg.repo_suffix)
-    pte_name = naming.cpu_gpu_file(model_id, backend, recipe.qmode, window)
+    # The recipe goes in the file name, and a solve is a different recipe from rounding: a
+    # reader, and a repository holding both, must be able to tell them apart. export_llm
+    # still gets the plain qmode, which is one of its own enum values.
+    qmode_label = f"{recipe.qmode}-gptq" if codes is not None else recipe.qmode
+    pte_name = naming.cpu_gpu_file(model_id, backend, qmode_label, window)
     pte_path_in_repo = f"{backend}/{pte_name}"
     problems = naming.check_app_rules(output_repo, pte_path_in_repo, backend)
     if problems:
@@ -255,14 +259,18 @@ def run(
             "model_class": plan.model_class,
             "converter": plan.converter,
             "params": plan.params,
-            "qmode": recipe.qmode,
+            "qmode": qmode_label,
+            "export_llm_qmode": recipe.qmode,
             "group_size": recipe.group_size,
             "embedding_quantize": recipe.embedding_quantize,
             "embedding_hqq": recipe.embedding_hqq,
             "int4_codes": "gptq" if codes is not None else "round-to-nearest",
             "prefill_chunk": min(cfg.prefill_chunk, window),
             "kv_cache_dtype": "fp32",
-            "label": f"{recipe.qmode}-g{recipe.group_size}, int8 embeddings",
+            "label": (
+                f"{qmode_label}-g{recipe.group_size}, int8 embeddings"
+                + (", int4 codes solved with GPTQ" if codes is not None else ", int4 codes rounded to nearest")
+            ),
             "description": (
                 f"ExecuTorch {toolchain()['executorch']} `export_llm`: 8-bit dynamic activations "
                 f"and 4-bit weights in groups of {recipe.group_size}, int8 per-channel embeddings, "
