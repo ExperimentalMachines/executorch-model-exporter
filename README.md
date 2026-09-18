@@ -2,7 +2,7 @@
 
 Exports small open-weight LLMs from Hugging Face to ExecuTorch `.pte` files for the
 [openweights](https://github.com/alpharomercoma/openweights) Android app, on standard
-GitHub-hosted runners. Design and decisions: [docs/PLAN.md](docs/PLAN.md).
+hosted CI runners. Design and decisions: [docs/PLAN.md](docs/PLAN.md).
 
 | Backend | Status |
 |---|---|

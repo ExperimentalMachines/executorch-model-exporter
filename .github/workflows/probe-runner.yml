@@ -23,7 +23,10 @@ jobs:
       fail-fast: false
       matrix:
         context: ${{ fromJSON(inputs.contexts) }}
-    runs-on: ubuntu-latest
+    # Sized on memory, not cores: 24 GB against the 4 vCPU size's 12, because the
+    # causal masks grow with the window squared and have killed a 32k export before
+    # (docs/research findings 2 and 28). The CPU knee is not yet measured.
+    runs-on: blacksmith-8vcpu-ubuntu-2404-arm
     timeout-minutes: 120
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}

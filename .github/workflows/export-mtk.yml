@@ -38,7 +38,8 @@ concurrency:
 
 jobs:
   targets:
-    runs-on: ubuntu-latest
+    # Hub metadata only, no model download.
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     outputs:
       socs: ${{ steps.socs.outputs.socs }}
       contexts: ${{ steps.contexts.outputs.contexts }}
@@ -86,7 +87,9 @@ jobs:
       matrix:
         soc: ${{ fromJSON(needs.targets.outputs.socs) }}
         context: ${{ fromJSON(needs.targets.outputs.contexts) }}
-    runs-on: ubuntu-latest
+    # Stays on x86: mtk_converter 8.13.0 is a cp310 x86 build and the NeuroPilot SDK
+    # ships x86_64 libraries (finding 14).
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 350
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
