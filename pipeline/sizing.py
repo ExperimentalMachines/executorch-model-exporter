@@ -39,6 +39,16 @@ class Architecture:
     intermediate: int
     total_params: int  # HF safetensors total: whatever the checkpoint stores
     tied_embeddings: bool
+    # How many layers actually attend. Equal to n_layers for a plain transformer, smaller
+    # for a hybrid: LFM2's short-convolution layers keep a few columns of state instead of
+    # a KV cache, and build no causal mask. Counting them as attention layers overstates
+    # the export peak enough to refuse a window that fits, and the masks are the dominant
+    # term at 32k.
+    attention_layers: int | None = None
+
+    @property
+    def attending(self) -> int:
+        return self.n_layers if self.attention_layers is None else self.attention_layers
 
     @property
     def embedding_params(self) -> int:
@@ -59,8 +69,8 @@ class Architecture:
 
 
 def kv_cache_bytes(arch: Architecture, context: int) -> int:
-    """K and V for every layer, every KV head, every position, fp32."""
-    return arch.n_layers * 2 * arch.n_kv_heads * arch.head_dim * context * FP32_BYTES
+    """K and V for every attending layer, every KV head, every position, fp32."""
+    return arch.attending * 2 * arch.n_kv_heads * arch.head_dim * context * FP32_BYTES
 
 
 def pte_bytes_estimate(arch: Architecture, context: int) -> int:
@@ -79,8 +89,9 @@ def device_resident_bytes(arch: Architecture, context: int, overhead: int) -> in
 def causal_mask_bytes(arch: Architecture, context: int) -> int:
     """Every AttentionMHA layer builds its own window x window bool mask at construction
     (ExecuTorch 1.4.0 examples/models/llama/attention.py). The custom SDPA op does not keep
-    it in the .pte, but the eager model holds all of them while exporting."""
-    return arch.n_layers * context * context
+    it in the .pte, but the eager model holds all of them while exporting. A hybrid's
+    convolution layers are not AttentionMHA and build none."""
+    return arch.attending * context * context
 
 
 def export_peak_bytes(arch: Architecture, context: int) -> int:

@@ -1,4 +1,5 @@
 import copy
+import dataclasses
 
 import pytest
 from conftest import hf_config, load_json
@@ -154,3 +155,26 @@ def test_lfm2_survives_a_config_that_lost_block_ff_dim():
     config = _lfm2_config()
     del config["block_ff_dim"]
     assert families.lfm2_hidden_dim(config) == 8192
+
+
+def test_a_hybrid_reports_only_the_layers_that_attend():
+    # LFM2 keeps a few columns of convolution state instead of a KV cache on most layers,
+    # and builds no causal mask there. Counting all 16 as attention layers overstated the
+    # 32k export peak enough to refuse a window that fits.
+    assert families.attending_layers(_lfm2_config()) == 1  # one full_attention of four
+    assert families.attending_layers({"layer_types": ["full_attention"] * 4}) == 4
+    # A plain transformer says nothing, and every layer attends.
+    assert families.attending_layers({}) is None
+
+
+def test_the_memory_model_uses_the_attending_count():
+    from pipeline import sizing
+
+    arch = families.architecture(_lfm2_config(), 1_200_000_000)
+    assert arch.n_layers == 4
+    assert arch.attending == 1
+    # Masks and KV both scale with the attending layers, not the total.
+    assert sizing.causal_mask_bytes(arch, 1024) == 1 * 1024 * 1024
+    plain = dataclasses.replace(arch, attention_layers=None)
+    assert sizing.causal_mask_bytes(plain, 1024) == 4 * 1024 * 1024
+    assert sizing.kv_cache_bytes(arch, 1024) < sizing.kv_cache_bytes(plain, 1024)

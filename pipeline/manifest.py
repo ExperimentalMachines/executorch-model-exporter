@@ -18,6 +18,10 @@ CONFIG_METHODS = (
     "use_kv_cache",
     "use_sdpa_with_kv_cache",
     "enable_dynamic_shape",
+    # LFM2 only, and the reason it is here: a host reads this to tell an export that clears
+    # its short-convolution state from one that leaks it between prompts, and the app reads
+    # config.json before it downloads anything (pipeline/lfm2_state.py).
+    "get_state_reset_at_zero",
 )
 
 # Attribution the upstream licenses require of redistributed derivatives, keyed by the

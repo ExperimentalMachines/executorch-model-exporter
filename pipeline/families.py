@@ -211,7 +211,22 @@ def architecture(config: dict, total_params: int) -> Architecture:
         total_params=int(total_params),
         # transformers' PretrainedConfig default, the same one convert.py assumes.
         tied_embeddings=bool(c.get("tie_word_embeddings", True)),
+        attention_layers=attending_layers(c),
     )
+
+
+def attending_layers(c: dict) -> int | None:
+    """How many layers attend, or None when every one of them does.
+
+    A hybrid says so in ``layer_types``: LFM2.5-1.2B attends on 6 of 16 and the 2.6B on 8 of
+    30, the rest being short convolutions that keep a few columns of state and build no
+    causal mask. The memory model needs the smaller count or it refuses windows that fit.
+    """
+    layer_types = c.get("layer_types")
+    if not layer_types:
+        return None
+    attending = sum(1 for t in layer_types if t != "conv")
+    return attending or None
 
 
 def lfm2_hidden_dim(c: dict) -> int:
