@@ -4,10 +4,16 @@ name: Watch Hugging Face
 # the `state` branch. The first run records existing models without exporting them.
 
 on:
-  schedule:
-    # Hourly: a stage (XNNPACK, then QNN, then MediaTek) hands over to the next on the pass
-    # after its last run finishes.
-    - cron: "17 * * * *"
+  # The hourly schedule is off (2026-09-19, at the maintainer's request). It dispatched
+  # exports on its own, which is fine when nothing else is running and confusing when
+  # something is: during the LFM2.5 publish it queued a second run of the same model behind
+  # the concurrency lock, at a commit one behind, which would have published ungated.
+  # Restore by uncommenting; the watcher is still fine to run by hand, and `backfill` takes
+  # the model ids to export now.
+  #  schedule:
+  #    # Hourly: a stage (XNNPACK, then QNN, then MediaTek) hands over to the next on the
+  #    # pass after its last run finishes.
+  #    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       backfill:
