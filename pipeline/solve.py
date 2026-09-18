@@ -190,8 +190,44 @@ def int4_linears(model) -> dict:
     return found
 
 
-def solve_model(model, sequences, damp: float = 0.01, act_quant: bool = True, log=print) -> dict:
-    """Solve every int4 linear, layer by layer, and return ``name -> {qdata, scale}``."""
+def teacher(src_dir: Path):
+    """The fp32 Hugging Face model as a greedy continuation function, and the model itself.
+
+    The replies are what GPTQ is asked to protect, so they come from the unquantised model,
+    and from Hugging Face's own implementation rather than the module ``export_llm`` traces:
+    ``generate`` carries a KV cache, and the app-shaped rows are ~530 tokens of head before
+    the question starts. Re-forwarding the whole sequence for every token instead cost 31 of
+    the 41 minutes the solve job spent on an 8-vCPU ARM runner with rows a tenth as long.
+    The caller frees it before the eager model is built, so only one copy is ever resident.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(str(src_dir), dtype=torch.float32).eval()
+
+    def generate(ids: list[int], max_new_tokens: int) -> list[int]:
+        with torch.no_grad():
+            out = model.generate(
+                torch.tensor([ids], dtype=torch.long),
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=model.config.eos_token_id,
+            )
+        return out[0, len(ids) :].tolist()
+
+    return model, generate
+
+
+def solve_model(model, rows, damp: float = 0.01, act_quant: bool = True, log=print) -> dict:
+    """Solve every int4 linear, layer by layer, and return ``name -> {qdata, scale}``.
+
+    ``rows`` is ``calibration.sequences``' output: ``(token ids, first position to count)``.
+    The app-shaped rows all open with the same ~530-token head, which is in the sequence
+    because without it the questions would not carry the app's distribution, but is counted
+    in one row only. Counted in every row it would be four fifths of the Hessian's mass and
+    the questions and replies -- the positions the tool-call decision lives in -- would be
+    what the solve rounds away first.
+    """
     torch = _torch()
     from torch import nn
 
@@ -204,15 +240,23 @@ def solve_model(model, sequences, damp: float = 0.01, act_quant: bool = True, lo
         captured.append((args, kwargs))
         raise _Stop
 
+    keeps = [keep for _, keep in rows]
     handle = model.layers[0].register_forward_pre_hook(grab, with_kwargs=True)
     with torch.no_grad():
-        for seq in sequences:
+        for ids, _ in rows:
             try:
-                model(torch.tensor([seq], dtype=torch.long))
+                model(torch.tensor([ids], dtype=torch.long))
             except _Stop:
                 pass
     handle.remove()
     hidden = [call[0][0] for call in captured]
+    # Which row the layer loop below is replaying, so the hooks know where to start counting.
+    row = [0]
+
+    def counted(x):
+        """``x`` from ``keeps[row]`` on, flattened to (positions, width)."""
+        start = keeps[row[0]]
+        return (x[:, start:, :] if x.dim() == 3 else x[start:]).reshape(-1, x.shape[-1])
 
     codes: dict = {}
     started = time.time()
@@ -226,7 +270,9 @@ def solve_model(model, sequences, damp: float = 0.01, act_quant: bool = True, lo
             for name, module in linears.items():
 
                 def accumulate(mod, args, name=name, hess=hess, counts=counts):
-                    x = args[0].reshape(-1, args[0].shape[-1])
+                    x = counted(args[0])
+                    if x.shape[0] == 0:
+                        return
                     if act_quant:
                         x = fake_act(x)
                     hess[name] += x.T @ x
@@ -234,6 +280,7 @@ def solve_model(model, sequences, damp: float = 0.01, act_quant: bool = True, lo
 
                 hooks.append(module.register_forward_pre_hook(accumulate))
             for i, (args, kwargs) in enumerate(captured):
+                row[0] = i
                 layer(hidden[i], *args[1:], **kwargs)
             for hook in hooks:
                 hook.remove()
@@ -255,8 +302,11 @@ def solve_model(model, sequences, damp: float = 0.01, act_quant: bool = True, lo
             width = head.weight.shape[1]
             hess_head = torch.zeros(width, width)
             positions = 0
-            for state in hidden:
-                x = model.norm(state).reshape(-1, width)
+            for index, state in enumerate(hidden):
+                row[0] = index
+                x = counted(model.norm(state))
+                if x.shape[0] == 0:
+                    continue
                 if act_quant:
                     x = fake_act(x)
                 hess_head += x.T @ x
@@ -298,14 +348,19 @@ def run(model_id: str, revision: str, out: Path, work_dir: Path, damp: float = 0
     print("==> converting checkpoint")
     convert.convert(src_dir, checkpoint, plan.converter, families.text_config(source.config))
 
-    print("==> building the eager model")
-    model = eager_model(plan.model_class, plan.params, checkpoint, work_dir)
-
     print("==> calibration")
+    import gc
+
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(src_dir))
-    rows = calibration.sequences(model, tokenizer)
+    fp32, generate = teacher(src_dir)
+    rows = calibration.sequences(generate, tokenizer)
+    del fp32, generate
+    gc.collect()
+
+    print("==> building the eager model")
+    model = eager_model(plan.model_class, plan.params, checkpoint, work_dir)
 
     print(f"==> solving {len(int4_linears(model))} linears")
     started = time.time()
@@ -319,7 +374,8 @@ def run(model_id: str, revision: str, out: Path, work_dir: Path, damp: float = 0
         "revision": source.sha,
         "linears": len(codes),
         "calibration_rows": len(rows),
-        "calibration_positions": sum(len(r) for r in rows),
+        "calibration_positions": sum(len(ids) - keep for ids, keep in rows),
+        "calibration_app_rows": len(calibration.SEARCH_ROWS) + len(calibration.KNOWN_ROWS),
         "seconds": round(seconds, 1),
         "damp": damp,
     }
