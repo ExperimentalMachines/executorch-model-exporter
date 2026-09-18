@@ -16,6 +16,10 @@ on:
         description: JSON list of context windows in tokens, one job each; empty for every tier in config/pipeline.yaml
         default: ""
         type: string
+      gptq:
+        description: Solve the int4 codes with GPTQ instead of rounding them (one solve, reused by every window)
+        default: true
+        type: boolean
       publish_hf:
         description: Publish to the Hugging Face org in config/pipeline.yaml
         default: true
@@ -63,8 +67,44 @@ jobs:
           )
           echo "contexts=$CONTEXTS" >>"$GITHUB_OUTPUT"
 
-  export:
+  solve:
+    # One solve per model, not per window: the codes are per linear, and the window changes
+    # the KV cache and the masks, never the weights. Every window's export reuses this
+    # artifact, which is why it is worth a job of its own.
     needs: targets
+    if: ${{ inputs.gptq }}
+    # Sized on memory like the export: it holds the fp32 model and one layer's Hessians.
+    runs-on: blacksmith-8vcpu-ubuntu-2404-arm
+    timeout-minutes: 350
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      MODEL_ID: ${{ inputs.model_id }}
+      REVISION: ${{ inputs.revision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-export
+        with:
+          swap-gib: "24"
+
+      - name: Solve the int4 codes
+        run: |
+          python -m pipeline solve "$MODEL_ID" --revision "$REVISION" \
+            --out "$WORK_DIR/codes.pt" --work "$WORK_DIR/solve-work" | tee "$WORK_DIR/solve.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gptq-codes-${{ github.run_id }}
+          path: |
+            ${{ env.WORK_DIR }}/codes.pt
+            ${{ env.WORK_DIR }}/solve.json
+          retention-days: 7
+          if-no-files-found: error
+
+  export:
+    needs: [targets, solve]
+    if: ${{ always() && needs.targets.result == 'success' && needs.solve.result != 'failure' }}
     strategy:
       fail-fast: false
       matrix:
@@ -87,14 +127,22 @@ jobs:
         with:
           swap-gib: "24"
 
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.gptq }}
+        with:
+          name: gptq-codes-${{ github.run_id }}
+          path: ${{ env.WORK_DIR }}
+
       # Exit 4 means this runner cannot build this window (memory grows with the square of
       # the window): recorded as a skip, so the other windows' jobs stand on their own.
       - name: Export and smoke-test
         run: |
           echo "ARTIFACT=xnnpack-${MODEL_ID//\//--}-${CONTEXT}" >>"$GITHUB_ENV"
           set +e
+          CODES=""
+          if [ -f "$WORK_DIR/codes.pt" ]; then CODES="--codes $WORK_DIR/codes.pt"; fi
           python -m pipeline export-xnnpack "$MODEL_ID" --revision "$REVISION" --context "$CONTEXT" \
-            --out "$WORK_DIR/out" --work "$WORK_DIR/work"
+            --out "$WORK_DIR/out" --work "$WORK_DIR/work" $CODES
           rc=$?
           set -e
           if [ "$rc" -eq 4 ]; then

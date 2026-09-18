@@ -50,6 +50,14 @@ def _run_export(export) -> int:
     return 0
 
 
+def _solve(args) -> int:
+    from pipeline import solve as solve_module
+
+    report = solve_module.run(args.model, args.revision, Path(args.out), Path(args.work), damp=args.damp)
+    print(json.dumps(report, indent=2))
+    return 0
+
+
 def _export_xnnpack(args) -> int:
     from pipeline import export_xnnpack
 
@@ -62,6 +70,7 @@ def _export_xnnpack(args) -> int:
             context=args.context,
             keep_work=args.keep_work,
             skip_smoke=args.skip_smoke,
+            codes=Path(args.codes) if args.codes else None,
         )
     )
 
@@ -186,7 +195,20 @@ def main(argv: list[str] | None = None) -> int:
         "--keep-work", action="store_true", help="keep the work dir after success (a failure always leaves it)"
     )
     export.add_argument("--skip-smoke", action="store_true")
+    export.add_argument(
+        "--codes",
+        default=None,
+        help="codes.pt from `solve`; without it the int4 weights are rounded to nearest",
+    )
     export.set_defaults(func=_export_xnnpack)
+
+    solve = commands.add_parser("solve", help="GPTQ the int4 codes once per model, for every window to reuse")
+    solve.add_argument("model")
+    solve.add_argument("--revision", default="main")
+    solve.add_argument("--out", default="codes.pt")
+    solve.add_argument("--work", default="work")
+    solve.add_argument("--damp", type=float, default=0.01, help="Hessian damping, as a fraction of its mean diagonal")
+    solve.set_defaults(func=_solve)
 
     vulkan = commands.add_parser("export-vulkan", help="download, convert, export a Vulkan (GPU) .pte")
     vulkan.add_argument("model")

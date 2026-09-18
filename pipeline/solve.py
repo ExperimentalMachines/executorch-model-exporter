@@ -265,3 +265,61 @@ def solve_model(model, sequences, damp: float = 0.01, act_quant: bool = True, lo
             codes["output"] = {"qdata": q, "scale": s}
             log(f"output head solved, {time.time() - started:.0f}s")
     return codes
+
+
+def run(model_id: str, revision: str, out: Path, work_dir: Path, damp: float = 0.01) -> dict:
+    """Solve one model's int4 codes and write them to ``out``.
+
+    One solve serves every window: the codes are per linear, and the window changes only the
+    KV cache and the masks, not the weights. So this runs once per model and the export
+    matrix reuses its artifact, which is also why it is a separate job.
+    """
+    import torch
+
+    from pipeline import calibration, convert, eligibility, families, hub, settings
+    from pipeline.exporting import ExportError
+
+    cfg = settings.load()
+    source = hub.fetch(model_id, revision)
+    verdict = eligibility.evaluate(source, cfg)
+    if verdict.reasons:
+        raise ExportError(f"{model_id} is not eligible: {'; '.join(verdict.reasons)}")
+    if verdict.backends["xnnpack"] is not None:
+        raise ExportError(f"{model_id} cannot be exported to xnnpack: {verdict.backends['xnnpack']}")
+
+    family = families.family_for(source.config)
+    plan = families.xnnpack_plan(family, source.config)
+    src_dir = work_dir / "source"
+    checkpoint = work_dir / "checkpoint" / "consolidated.pth"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"==> solve {model_id}@{source.sha[:12]}: family {family.key}, class {plan.model_class}")
+    hub.download(source, src_dir)
+    print("==> converting checkpoint")
+    convert.convert(src_dir, checkpoint, plan.converter, families.text_config(source.config))
+
+    print("==> building the eager model")
+    model = eager_model(plan.model_class, plan.params, checkpoint, work_dir)
+
+    print("==> calibration")
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(str(src_dir))
+    rows = calibration.sequences(model, tokenizer)
+
+    print(f"==> solving {len(int4_linears(model))} linears")
+    started = time.time()
+    codes = solve_model(model, rows, damp=damp)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(codes, out)
+    seconds = time.time() - started
+    print(f"==> wrote {out} ({len(codes)} linears) in {seconds:.0f}s")
+    return {
+        "model_id": model_id,
+        "revision": source.sha,
+        "linears": len(codes),
+        "calibration_rows": len(rows),
+        "calibration_positions": sum(len(r) for r in rows),
+        "seconds": round(seconds, 1),
+        "damp": damp,
+    }
