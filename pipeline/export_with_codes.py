@@ -89,7 +89,16 @@ def main(argv: list[str] | None = None) -> int:
             quantised = upstream(model, qmode, *rest, **kwargs)
             if qmode != "8da4w":
                 return quantised
-            inject(quantised, codes)
+            injected, _ = inject(quantised, codes)
+            # Every code must find its tensor. If the solve was run against a different
+            # checkpoint, or a name moved, the export would otherwise finish, be labelled
+            # GPTQ, and carry weights that were quietly rounded instead.
+            if injected != len(codes):
+                missing = sorted(set(codes) - {n for n, _ in quantised.named_modules()})
+                raise ValueError(
+                    f"{len(codes)} solved tensors but {injected} were injected; "
+                    f"these codes match no module: {missing[:5]}"
+                )
             return quantised
 
         quantize_module.quantize = quantize

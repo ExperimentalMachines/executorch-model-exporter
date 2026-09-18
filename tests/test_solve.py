@@ -85,3 +85,44 @@ def test_the_activation_rounding_matches_what_the_delegate_does():
     for row_in, row_out in zip(x, q, strict=True):
         assert len(torch.unique(row_out)) <= 256
         assert float((row_out - row_in).abs().max()) < float(row_in.abs().max())
+
+
+def test_injection_refuses_codes_that_do_not_match_the_model():
+    # A solve run against a different checkpoint, or a renamed module, would otherwise
+    # export cleanly, be labelled GPTQ and carry weights that were quietly rounded.
+    from pipeline import export_with_codes
+
+    class Fake:
+        def named_modules(self):
+            return []
+
+    injected, left = export_with_codes.inject(Fake(), {"layers.0.attention.wq": {"qdata": None, "scale": None}})
+    assert injected == 0
+    assert left == []
+
+
+def test_injection_checks_the_grid_before_writing():
+    from pipeline import export_with_codes
+
+    class Weight:
+        def __init__(self):
+            self.qdata = torch.zeros(4, 32, dtype=torch.int8)
+            self.scale = torch.ones(4, 1)
+            self.zero_point = torch.zeros(4, 1)
+
+    class Module:
+        def __init__(self):
+            self.weight = Weight()
+
+        def named_modules(self):
+            return [("linear", self)]
+
+    # A negative scale is not representable in XNNPACK's blockwise int4 format.
+    bad = {"linear": {"qdata": torch.zeros(4, 32, dtype=torch.int8), "scale": -torch.ones(4, 1)}}
+    with pytest.raises(ValueError, match="not positive"):
+        export_with_codes.inject(Module(), bad)
+
+    # Nor is a code outside -8..7.
+    off_grid = {"linear": {"qdata": torch.full((4, 32), 9, dtype=torch.int8), "scale": torch.ones(4, 1)}}
+    with pytest.raises(ValueError, match="int4 grid"):
+        export_with_codes.inject(Module(), off_grid)

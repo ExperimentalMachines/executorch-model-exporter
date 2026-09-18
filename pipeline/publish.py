@@ -78,6 +78,18 @@ def publish_hf(
 
     cfg = settings.load()
     report = load_report(out_dir, backend, target, context)
+    # The workflow runs the smoke test in its own job and fails before reaching this, but
+    # publish is also a command a person can run by hand, against a directory exported with
+    # --skip-smoke. Refusing here is what makes "published" mean "ran and answered" rather
+    # than "the workflow happened to be wired correctly that day".
+    smoke = report.get("smoke")
+    if smoke is None:
+        raise ValueError(
+            f"{report['files'][0]['path']} has no smoke result: run `python -m pipeline verify` "
+            "on this directory before publishing it"
+        )
+    if not smoke.get("passed"):
+        raise ValueError(f"{report['files'][0]['path']} failed its smoke test: {'; '.join(smoke.get('problems', []))}")
     repo_id = report["output_repo"]
     folder = _folder(backend, target)
     label = naming.window_label(report["window"]["context"])
