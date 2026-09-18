@@ -53,9 +53,22 @@ _MTK_LLAMA = (
 )
 _MTK_GEMMA3 = "not validated on the MediaTek scripts (they expect model_type gemma3, HF has gemma3_text)"
 _MTK_NO_MODEL = "no model definition for this architecture in ExecuTorch 1.4.0's examples/mediatek"
+_LFM2_NO_VULKAN = (
+    "the Vulkan delegate has no kernel for the short convolution, and an LFM2.5 file that "
+    "lowers to it segfaults in the 1.4.0 runtime at the first prefill"
+)
+_LFM2_NO_QNN = "not in ExecuTorch 1.4.0's Qualcomm SUPPORTED_LLM_MODELS registry"
 
 FAMILIES: tuple[Family, ...] = (
     Family("qwen3", ("Qwen3ForCausalLM",)),
+    # LFM2 is a short-convolution hybrid: only some layers attend. ExecuTorch 1.4.0 has it
+    # under examples/models/lfm2 for XNNPACK, and neither vendor NPU path has a definition
+    # for it, nor does the Vulkan recipe cover the convolution.
+    Family(
+        "lfm2",
+        ("Lfm2ForCausalLM",),
+        {"vulkan": _LFM2_NO_VULKAN, "qnn": _LFM2_NO_QNN, "mtk": _MTK_NO_MODEL},
+    ),
     Family("qwen2_5", ("Qwen2ForCausalLM",)),
     Family("llama", ("LlamaForCausalLM",), {"mtk": _MTK_LLAMA}),
     Family(
@@ -201,6 +214,24 @@ def architecture(config: dict, total_params: int) -> Architecture:
     )
 
 
+def lfm2_hidden_dim(c: dict) -> int:
+    """LFM2's feed-forward width, which is not the config's ``intermediate_size``.
+
+    Liquid's block auto-adjusts it: two thirds of ``block_ff_dim``, times
+    ``block_ffn_dim_multiplier``, rounded up to ``block_multiple_of``. For LFM2.5-1.2B that
+    turns 12,288 into 8,192, and the published weights are 8,192 wide, so reading
+    ``intermediate_size`` instead would build a model that cannot load its own checkpoint.
+    When ``block_auto_adjust_ff_dim`` is false, as in LFM2.5-2.6B, the config's value stands
+    (10,752 there, matching its weights).
+    """
+    if not c.get("block_auto_adjust_ff_dim"):
+        return int(c["intermediate_size"])
+    ff = int(2 * int(c["block_ff_dim"]) / 3)
+    ff = int(float(c.get("block_ffn_dim_multiplier") or 1) * ff)
+    multiple = int(c.get("block_multiple_of") or 256)
+    return multiple * ((ff + multiple - 1) // multiple)
+
+
 def _common_params(c: dict) -> dict:
     n_heads = int(c["num_attention_heads"])
     dim = int(c["hidden_size"])
@@ -212,7 +243,7 @@ def _common_params(c: dict) -> dict:
         "head_dim": int(c.get("head_dim") or dim // n_heads),
         "n_kv_heads": int(c.get("num_key_value_heads") or n_heads),
         "n_layers": int(c["num_hidden_layers"]),
-        "norm_eps": float(c["rms_norm_eps"]),
+        "norm_eps": float(c.get("rms_norm_eps") or c["norm_eps"]),
         "rope_theta": rope_theta(c),
         "vocab_size": int(c["vocab_size"]),
     }
@@ -257,6 +288,30 @@ def xnnpack_plan(family: Family, config: dict) -> XnnpackPlan:
             qk_norm_before_rope=True,
         )
         return XnnpackPlan("qwen3_1_7b", params, "qwen3")
+
+    if family.key == "lfm2":
+        _require(rope_scaling(c) is None, "RoPE scaling (e.g. YaRN) is not supported")
+        layer_types = c.get("layer_types")
+        _require(bool(layer_types), "LFM2 config has no layer_types")
+        _require(
+            len(layer_types) == int(c["num_hidden_layers"]),
+            "layer_types does not match num_hidden_layers",
+        )
+        _require(
+            set(layer_types) <= {"conv", "full_attention"},
+            f"unknown LFM2 layer types: {sorted(set(layer_types))}",
+        )
+        _require(not c.get("conv_bias"), "LFM2 with a convolution bias is not supported")
+        params.update(
+            hidden_dim=lfm2_hidden_dim(c),
+            use_scaled_rope=False,
+            use_hf_rope=True,
+            use_qk_norm=True,
+            qk_norm_before_rope=True,
+            layer_types=list(layer_types),
+        )
+        params.pop("head_dim", None)
+        return XnnpackPlan("lfm2_5_1_2b", params, "lfm2")
 
     if family.key == "qwen2_5":
         _require(rope_scaling(c) is None, "RoPE scaling (e.g. YaRN) is not supported")

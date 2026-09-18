@@ -93,3 +93,55 @@ def test_gemma3_has_a_family_but_no_xnnpack_recipe_yet():
     assert not family.supports("xnnpack")
     with pytest.raises(families.UnsupportedModel):
         families.xnnpack_plan(family, hf_config("google/gemma-3-1b-it"))
+
+
+def _lfm2_config(**overrides):
+    """LFM2.5-1.2B-Instruct's config, trimmed to what the plan reads."""
+    config = {
+        "architectures": ["Lfm2ForCausalLM"],
+        "hidden_size": 2048,
+        "intermediate_size": 12288,
+        "block_ff_dim": 12288,
+        "block_auto_adjust_ff_dim": True,
+        "block_ffn_dim_multiplier": 1.0,
+        "block_multiple_of": 256,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "num_hidden_layers": 4,
+        "norm_eps": 1e-05,
+        "rope_theta": 1000000.0,
+        "vocab_size": 65536,
+        "conv_bias": False,
+        "layer_types": ["conv", "conv", "full_attention", "conv"],
+    }
+    config.update(overrides)
+    return config
+
+
+def test_lfm2_feed_forward_width_is_not_the_configs_intermediate_size():
+    # The published LFM2.5-1.2B weights are 8,192 wide while the config says 12,288: Liquid's
+    # block takes two thirds and rounds up to block_multiple_of. Reading intermediate_size
+    # would build a model that cannot load its own checkpoint.
+    assert families.lfm2_hidden_dim(_lfm2_config()) == 8192
+    # LFM2.5-2.6B turns the auto-adjust off, and then the config's value is the right one.
+    assert families.lfm2_hidden_dim(_lfm2_config(block_auto_adjust_ff_dim=False, intermediate_size=10752)) == 10752
+
+
+def test_lfm2_plan_carries_the_layer_types():
+    plan = families.xnnpack_plan(families.family_for(_lfm2_config()), _lfm2_config())
+    assert plan.model_class == "lfm2_5_1_2b"
+    assert plan.converter == "lfm2"
+    assert plan.params["layer_types"] == ["conv", "conv", "full_attention", "conv"]
+    assert plan.params["hidden_dim"] == 8192
+
+
+def test_lfm2_refuses_a_layer_type_list_that_does_not_match():
+    with pytest.raises(families.UnsupportedModel):
+        families.xnnpack_plan(families.family_for(_lfm2_config()), _lfm2_config(num_hidden_layers=5))
+
+
+def test_lfm2_is_not_offered_to_backends_without_a_definition():
+    family = families.family_for(_lfm2_config())
+    assert family.supports("xnnpack")
+    for backend in ("vulkan", "qnn", "mtk"):
+        assert not family.supports(backend)

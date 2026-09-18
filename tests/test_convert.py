@@ -128,3 +128,32 @@ def test_missing_layer_tensors_fail(tmp_path):
 def test_checkpoint_name_that_would_trigger_prequantized_loading(tmp_path):
     with pytest.raises(ValueError, match="pre-quantized"):
         convert.convert(tmp_path, tmp_path / "model-8da4w.pth", "qwen3", tiny_config())
+
+
+def test_lfm2_keys_map_to_executorchs_names():
+    m = lambda k: convert.map_key(k, "lfm2")  # noqa: E731
+    assert m("model.embed_tokens.weight") == "tok_embeddings.weight"
+    # LFM2 keeps the final norm under its own name and has no lm_head.
+    assert m("model.embedding_norm.weight") == "norm.weight"
+    # It names the attention output out_proj and the QK norms *_layernorm.
+    assert m("model.layers.2.self_attn.out_proj.weight") == "layers.2.attention.wo.weight"
+    assert m("model.layers.2.self_attn.q_layernorm.weight") == "layers.2.attention.q_norm_fn.weight"
+    # The block norm is operator_norm, where the other families say input_layernorm.
+    assert m("model.layers.0.operator_norm.weight") == "layers.0.attention_norm.weight"
+    # The feed-forward and the convolution already carry ExecuTorch's names.
+    assert m("model.layers.0.feed_forward.w1.weight") == "layers.0.feed_forward.w1.weight"
+    assert m("model.layers.0.conv.conv.weight") == "layers.0.conv.conv.weight"
+
+
+def test_lfm2_does_not_borrow_the_other_families_names():
+    # o_proj and input_layernorm belong to the common map, which LFM2 replaces rather than
+    # extends; accepting them would silently convert a checkpoint that is not LFM2.
+    for key in ("model.layers.0.self_attn.o_proj.weight", "model.layers.0.input_layernorm.weight"):
+        with pytest.raises(KeyError):
+            convert.map_key(key, "lfm2")
+
+
+def test_the_fused_convolution_projection_splits_into_three():
+    target, parts = convert.SPLIT_THREE["lfm2"]
+    assert target == "conv.in_proj.weight"
+    assert parts == ("conv.B_proj.weight", "conv.C_proj.weight", "conv.x_proj.weight")
