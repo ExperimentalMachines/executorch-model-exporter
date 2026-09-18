@@ -88,6 +88,66 @@ def test_publish_hf_retries_once_on_a_stale_parent_commit(tmp_path, monkeypatch)
     assert calls == ["rev1", "rev1"]  # re-read the repo and rebuilt the commit before retrying
 
 
+def test_a_concurrent_commit_is_retried_too(tmp_path, monkeypatch):
+    """409, not just 412. Five windows publish at once and the Hub answers either way.
+
+    Run 35373841386 published four of five windows and lost 8192 to a 409 that was not
+    retried, so the repository carried four of the five files it should have.
+    """
+    from huggingface_hub.errors import HfHubHTTPError
+
+    out = tmp_path / "out"
+    (out / "xnnpack").mkdir(parents=True)
+    (out / "tokenizer.json").write_text("{}")
+    (out / "xnnpack" / "Qwen3-1.7B-8da4w-2k.pte").write_bytes(b"pte")
+    (out / "xnnpack" / "export-report-2k.json").write_text(json.dumps(report(2048)))
+    hub = FakeHub({"README.md": None})
+    calls = []
+
+    def create_commit(repo_id, operations, commit_message, parent_commit):
+        calls.append(parent_commit)
+        if len(calls) == 1:
+            import httpx
+
+            response = httpx.Response(409, request=httpx.Request("POST", "https://huggingface.co/api"))
+            raise HfHubHTTPError("409 Conflict", response=response)
+        return SimpleNamespace(commit_url="https://hf/commit/2")
+
+    hub.create_commit = create_commit
+    monkeypatch.setattr(publish.hub, "api", lambda: hub)
+    monkeypatch.setattr(publish.time, "sleep", lambda s: None)
+    assert publish.publish_hf(out, "xnnpack") == "https://hf/commit/2"
+    assert calls == ["rev1", "rev1"]
+
+
+def test_a_status_that_is_not_a_race_still_raises(tmp_path, monkeypatch):
+    # Retrying a 403 or a 404 would turn a real failure into six slow ones and then the
+    # same failure, with the cause five minutes further from the top of the log.
+    from huggingface_hub.errors import HfHubHTTPError
+
+    out = tmp_path / "out"
+    (out / "xnnpack").mkdir(parents=True)
+    (out / "tokenizer.json").write_text("{}")
+    (out / "xnnpack" / "Qwen3-1.7B-8da4w-2k.pte").write_bytes(b"pte")
+    (out / "xnnpack" / "export-report-2k.json").write_text(json.dumps(report(2048)))
+    hub = FakeHub({"README.md": None})
+    calls = []
+
+    def create_commit(repo_id, operations, commit_message, parent_commit):
+        import httpx
+
+        calls.append(parent_commit)
+        response = httpx.Response(403, request=httpx.Request("POST", "https://huggingface.co/api"))
+        raise HfHubHTTPError("403 Forbidden", response=response)
+
+    hub.create_commit = create_commit
+    monkeypatch.setattr(publish.hub, "api", lambda: hub)
+    monkeypatch.setattr(publish.time, "sleep", lambda s: None)
+    with pytest.raises(HfHubHTTPError):
+        publish.publish_hf(out, "xnnpack")
+    assert len(calls) == 1
+
+
 def test_backend_config_merges_every_window_in_the_folder():
     config = manifest.backend_config([report(8192), report(2048), report(32768)])
     assert [v["context"] for v in config["variants"]] == [2048, 8192, 32768]

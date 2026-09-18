@@ -153,7 +153,13 @@ def publish_hf(
             return commit.commit_url
         except HfHubHTTPError as error:
             status = getattr(error.response, "status_code", None)
-            if status != 412 or attempt == attempts - 1:
+            # 412 is the parent_commit precondition failing; 409 is the Hub refusing a
+            # concurrent commit to the same branch. Both mean another window's job got
+            # there first, and both are fixed by rebuilding the commit against the head
+            # this loop re-reads at the top. Five windows publish at once, so this is the
+            # normal case, not an exceptional one: run 35373841386 lost the 8192 window to
+            # an unretried 409 while the other four went through.
+            if status not in (409, 412) or attempt == attempts - 1:
                 raise
             time.sleep(5 * (attempt + 1))
     raise RuntimeError("unreachable")
