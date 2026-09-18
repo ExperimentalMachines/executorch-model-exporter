@@ -51,9 +51,18 @@ def _run_export(export) -> int:
 
 
 def _verify(args) -> int:
+    # Its own wrapper rather than _run_export's: the exit codes are the same, but a verify
+    # returns how many windows it checked, not an export report with files and a window.
     from pipeline import verify as verify_module
+    from pipeline.exporting import ExportError
 
-    return _run_export(lambda: verify_module.run(Path(args.out), args.backend, Path(args.work)))
+    try:
+        summary = verify_module.run(Path(args.out), args.backend, Path(args.work))
+    except ExportError as error:
+        print(f"verify failed: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(summary, indent=2))
+    return 0
 
 
 def _solve(args) -> int:
