@@ -86,6 +86,11 @@ def export_llm_config(
             "qmode": recipe.qmode,
             "group_size": recipe.group_size,
             "embedding_quantize": recipe.embedding_quantize,
+            # Only the embedding reads this. torchao's HQQ search for its scales is
+            # platform-dependent, and a hosted runner is whatever GitHub gives the job, so
+            # with it on the same model built twice differs in the embedding's low bits and
+            # a small model decodes different text (finding 27).
+            "use_hqq": recipe.embedding_hqq,
         },
         "export": {
             "max_seq_length": min(prefill_chunk, context),
@@ -235,6 +240,7 @@ def run(
             "qmode": recipe.qmode,
             "group_size": recipe.group_size,
             "embedding_quantize": recipe.embedding_quantize,
+            "embedding_hqq": recipe.embedding_hqq,
             "prefill_chunk": min(cfg.prefill_chunk, window),
             "kv_cache_dtype": "fp32",
             "label": f"{recipe.qmode}-g{recipe.group_size}, int8 embeddings",

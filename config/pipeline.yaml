@@ -72,12 +72,17 @@ export:
     qmode: 8da4w
     group_size: 32
     embedding_quantize: "8,0"
+    # torchao's HQQ scale search for the embedding is platform-dependent, so the same model
+    # built on two hosted runners differs in the embedding's low bits and small models decode
+    # different text. Affine is deterministic; leave this false to keep builds reproducible.
+    embedding_hqq: false
   vulkan:
     # The GPU delegate runs the same torchao 8da4w linears (backends/vulkan/vulkan-quantization);
     # the file is otherwise the XNNPACK recipe with backend.vulkan in export_llm.
     qmode: 8da4w
     group_size: 32
     embedding_quantize: "8,0"
+    embedding_hqq: false
   qnn:
     # HTP context binaries are compiled per chip and load only on that chip. The benchmark
     # devices (docs/PLAN.md, "Devices"): Snapdragon 8 Elite (Galaxy S25 Ultra) = SM8750.

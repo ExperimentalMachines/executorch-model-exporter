@@ -17,6 +17,7 @@ class XnnpackRecipe:
     qmode: str
     group_size: int
     embedding_quantize: str
+    embedding_hqq: bool
 
 
 @dataclass(frozen=True)
@@ -102,11 +103,13 @@ def load() -> Settings:
             qmode=export["xnnpack"]["qmode"],
             group_size=int(export["xnnpack"]["group_size"]),
             embedding_quantize=str(export["xnnpack"]["embedding_quantize"]),
+            embedding_hqq=bool(export["xnnpack"].get("embedding_hqq", False)),
         ),
         vulkan=XnnpackRecipe(
             qmode=export["vulkan"]["qmode"],
             group_size=int(export["vulkan"]["group_size"]),
             embedding_quantize=str(export["vulkan"]["embedding_quantize"]),
+            embedding_hqq=bool(export["vulkan"].get("embedding_hqq", False)),
         ),
         qnn=QnnRecipe(
             socs=tuple(export["qnn"]["socs"]),
