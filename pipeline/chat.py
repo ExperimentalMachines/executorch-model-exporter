@@ -3,6 +3,23 @@
 The 1.4.0 runtime never adds BOS, so the app writes the family's BOS as text and relies on
 the tokenizer to encode it (openweights PromptTemplate.kt). Rendering the upstream chat
 template with ``bos_token`` filled in produces the same kind of prompt.
+
+Two things here were found the hard way on 2026-09-19, by an abliterated LFM2.5 that failed
+every window of its export and turned out not to be broken at all.
+
+*Render through transformers when it is installed.* LFM2.5's chat template uses ``{%
+generation %}``, which is transformers' own Jinja extension and which the sandbox below
+cannot compile. Every LFM2.5 export ever smoke-tested here therefore fell back to the plain
+completion prompt and the chat template was never exercised -- silently, because the
+fallback answers the question well enough to pass. transformers is already a dependency of
+the export, so its renderer is used first and the sandbox is the fallback, not the rule.
+
+*Never drop BOS.* The fallback used to write BOS only when ``add_bos_token`` was set.
+transformers 5.x does not write that key, so a checkpoint re-saved by it got a prompt with
+no BOS -- and LFM2.5 without BOS answers " is is is is is" to anything, which reads exactly
+like a destroyed export. Measured both ways on both checkpoints: with BOS both answer
+"Paris. It is the most populous city in France"; without it both degenerate. The app always
+writes BOS, so the smoke test always writes BOS.
 """
 
 from __future__ import annotations
@@ -46,12 +63,34 @@ def _environment():
     return env
 
 
+def _render_with_transformers(model_dir: Path) -> str | None:
+    """The tokenizer's own chat template, which knows the extensions the sandbox does not."""
+    try:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+        text = tokenizer.apply_chat_template(
+            [{"role": "user", "content": QUESTION}], tokenize=False, add_generation_prompt=True
+        )
+    except Exception:
+        return None
+    return text if isinstance(text, str) and text.strip() else None
+
+
 def render(model_dir: Path, tokenizer_config: dict, instruct: bool) -> str:
     """The prompt string for the smoke test."""
-    template = _template(model_dir, tokenizer_config) if instruct else None
     bos = _token_text(tokenizer_config.get("bos_token"))
+    if instruct:
+        rendered = _render_with_transformers(model_dir)
+        if rendered is not None:
+            # apply_chat_template may or may not have written BOS itself; the runtime adds
+            # none, so it has to be in the text exactly once.
+            return rendered if not bos or rendered.startswith(bos) else bos + rendered
+    template = _template(model_dir, tokenizer_config) if instruct else None
     if template is None:
-        return (bos if tokenizer_config.get("add_bos_token") else "") + COMPLETION
+        # BOS unconditionally: see the module docstring. Gating it on add_bos_token cost a
+        # healthy abliterated model five failed windows.
+        return bos + COMPLETION
     variables = {
         "messages": [{"role": "user", "content": QUESTION}],
         "add_generation_prompt": True,
