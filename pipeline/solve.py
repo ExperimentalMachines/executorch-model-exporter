@@ -204,6 +204,10 @@ def teacher(src_dir: Path):
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(str(src_dir), dtype=torch.float32).eval()
+    # Several families set eos_token_id to a list of stop tokens. generate() takes a list
+    # there but pad_token_id has to be one integer, so the first is the one to pad with.
+    eos = model.config.eos_token_id
+    pad = eos[0] if isinstance(eos, list | tuple) else eos
 
     def generate(ids: list[int], max_new_tokens: int) -> list[int]:
         with torch.no_grad():
@@ -211,7 +215,7 @@ def teacher(src_dir: Path):
                 torch.tensor([ids], dtype=torch.long),
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
-                pad_token_id=model.config.eos_token_id,
+                pad_token_id=pad,
             )
         return out[0, len(ids) :].tolist()
 

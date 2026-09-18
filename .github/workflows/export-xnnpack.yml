@@ -189,6 +189,7 @@ jobs:
       HF_HUB_DISABLE_PROGRESS_BARS: "1"
       MODEL_ID: ${{ inputs.model_id }}
       CONTEXT: ${{ matrix.context }}
+      GPTQ: ${{ inputs.gptq }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -229,8 +230,13 @@ jobs:
           GATE=""
           if [ -f "$WORK_DIR/gate/gate.json" ]; then
             GATE="--gate $WORK_DIR/gate/gate.json"
+          elif [ "$GPTQ" = "true" ]; then
+            # A solved run whose reference went missing must not fall through to an
+            # unguarded publish: that is the exact silence this gate exists to end.
+            echo "::error title=No decision gate::the solve produced no fp32 reference; refusing to publish ungated"
+            exit 1
           else
-            echo "::warning title=No decision gate::this run has no fp32 reference, so only the smoke test guards it"
+            echo "::warning title=No decision gate::rounded run, so only the smoke test guards it"
           fi
           python -m pipeline verify "$WORK_DIR/out" --backend xnnpack --work "$WORK_DIR/verify-work" $GATE
 

@@ -100,7 +100,7 @@ def reference(model, tokenizer) -> dict:
     rows = {}
     for question, text in prompts(tokenizer).items():
         ids = tokenizer(text, add_special_tokens=False, return_tensors="pt").input_ids
-        ids = ids.to(getattr(model, "device", "cpu"))
+        ids = ids.to(next(model.parameters()).device)
         with torch.no_grad():
             logits = model(ids).logits
         probs = torch.softmax(logits[0, -1].float(), -1)
