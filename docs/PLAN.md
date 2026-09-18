@@ -14,7 +14,7 @@ for it, Samsung Exynos (ENN). iOS is deferred.
 | Watched orgs | `Qwen`, `google`, `meta-llama`, `HuggingFaceTB`, each for its own families |
 | Trigger | Hourly watcher; eligible models are dispatched in stages, XNNPACK for every model first, then Vulkan, then Qualcomm, then MediaTek (a stage waits until the previous one has nothing queued or running) |
 | First run | Seeds state without exporting; existing models are backfilled by manual dispatch |
-| Runners | Blacksmith, one workflow run per backend and one job per window. Exports on `blacksmith-8vcpu-ubuntu-2404-arm` (8 vCPU, 24 GB); orchestration on the 2 vCPU ARM size; Qualcomm and MediaTek stay on x86 |
+| Runners | Blacksmith, one workflow run per backend and one job per window. Exports and the solve on `blacksmith-8vcpu-ubuntu-2404` (8 vCPU, 32 GB); orchestration and CI on the 2 vCPU ARM size. ARM cannot run the exports because the wheel's runner, and so the smoke test, fails on aarch64 (finding 30) |
 | Chips | The benchmark devices ("Devices" below): QNN SM8750 (Snapdragon 8 Elite), MediaTek MT6989 (Dimensity 9300+); SM8650 and MT6991 can be added in `config/pipeline.yaml` |
 | Outputs | Hugging Face Hub, GitHub Releases (files ≤ 2 GiB), Actions artifacts |
 | HF layout | One repo per model, backend folders; NPU exports published even though the app can't load them yet |

@@ -69,10 +69,15 @@ jobs:
       fail-fast: false
       matrix:
         context: ${{ fromJSON(needs.targets.outputs.contexts) }}
-    # Sized on memory, not cores: 24 GB against the 4 vCPU size's 12, because the
-    # causal masks grow with the window squared and have killed a 32k export before
-    # (docs/research findings 2 and 28). The CPU knee is not yet measured.
-    runs-on: blacksmith-8vcpu-ubuntu-2404-arm
+    # Sized on memory, not cores: 32 GB, because the causal masks grow with the window
+    # squared and have killed a 32k export before (docs/research findings 2 and 28). The
+    # CPU knee is not yet measured.
+    # Exports stay on x86 until the runner works on aarch64. The toolchain is arm64-clean and
+    # the export itself succeeded there, but the wheel's C++ TextLLMRunner raises
+    # `IndexError: stoi` on ARM, and that runner is the smoke test: without it a published
+    # file drops from "generated text and answered" to "the methods exist", which is the
+    # standard the QNN and MediaTek programs were withdrawn for (findings 28, 30).
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 350
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}

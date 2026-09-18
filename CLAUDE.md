@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 exe-expo exports small dense open-weight LLMs (≤4B, no MoE) from Hugging Face to ExecuTorch `.pte` files for the
 [openweights](https://github.com/alpharomercoma/openweights) Android app, running entirely on hosted CI runners
-(Blacksmith `blacksmith-8vcpu-ubuntu-2404-arm`: 8 vCPU, 24 GB RAM + 24 GiB swap this repo adds). `docs/PLAN.md` holds the decisions, measured costs, phase status and known
+(Blacksmith: exports on `blacksmith-8vcpu-ubuntu-2404`, 8 vCPU and 32 GB plus the 24 GiB swap this repo adds; the ARM sizes run orchestration and CI only, because the wheel's runner fails on aarch64, finding 30). `docs/PLAN.md` holds the decisions, measured costs, phase status and known
 limits. Read it before changing sizing, backends or naming, and update it when a decision or measurement changes.
 
 ## Commands
