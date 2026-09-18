@@ -145,3 +145,12 @@ def test_lfm2_is_not_offered_to_backends_without_a_definition():
     assert family.supports("xnnpack")
     for backend in ("vulkan", "qnn", "mtk"):
         assert not family.supports(backend)
+
+
+def test_lfm2_survives_a_config_that_lost_block_ff_dim():
+    # heretic's abliterated LFM2.5-1.2B keeps block_auto_adjust_ff_dim and drops
+    # block_ff_dim. intermediate_size holds the same unadjusted 12,288, and the published
+    # weights are 8,192 wide, so the rule has to fall back to it rather than fail.
+    config = _lfm2_config()
+    del config["block_ff_dim"]
+    assert families.lfm2_hidden_dim(config) == 8192

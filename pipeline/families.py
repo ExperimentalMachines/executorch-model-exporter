@@ -226,7 +226,12 @@ def lfm2_hidden_dim(c: dict) -> int:
     """
     if not c.get("block_auto_adjust_ff_dim"):
         return int(c["intermediate_size"])
-    ff = int(2 * int(c["block_ff_dim"]) / 3)
+    # A re-saved checkpoint can lose block_ff_dim while keeping the flag: heretic's
+    # abliterated LFM2.5-1.2B has block_auto_adjust_ff_dim true and no block_ff_dim.
+    # intermediate_size carries the same unadjusted value in every LFM2.5 config seen
+    # (12,288 in both the base and the abliterated 1.2B), and putting it through the rule
+    # gives the 8,192 the published weights actually are, in both.
+    ff = int(2 * int(c.get("block_ff_dim") or c["intermediate_size"]) / 3)
     ff = int(float(c.get("block_ffn_dim_multiplier") or 1) * ff)
     multiple = int(c.get("block_multiple_of") or 256)
     return multiple * ((ff + multiple - 1) // multiple)

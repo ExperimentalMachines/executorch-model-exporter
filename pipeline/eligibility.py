@@ -16,6 +16,10 @@ FAMILY_APP_TOKENS = {
     "llama": {"llama32", "smollm2"},
     "gemma3": {"gemma3"},
     "smollm3": {"smollm3"},
+    # The app has a template for LFM2.5 only. A plain LFM2 release shares the architecture
+    # class but reads as no app family at all, so it is refused below rather than exported
+    # into a file the app cannot render.
+    "lfm2": {"lfm25"},
 }
 # What a release of each family is called. The architecture class alone is not enough: a
 # later generation can keep the class (a text-only "Qwen3.8" on Qwen3ForCausalLM would pass
@@ -23,6 +27,7 @@ FAMILY_APP_TOKENS = {
 FAMILY_NAME_PATTERNS = {
     "qwen3": re.compile(r"qwen3(?![.\d])", re.IGNORECASE),
     "qwen2_5": re.compile(r"qwen2\.5(?![.\d])", re.IGNORECASE),
+    "lfm2": re.compile(r"lfm2\.5(?![.\d])", re.IGNORECASE),
     "llama": re.compile(r"llama-?3\.2(?![.\d])|smollm2(?!\d)", re.IGNORECASE),
     "gemma3": re.compile(r"gemma-?3(?![.\dn])", re.IGNORECASE),
     "smollm3": re.compile(r"smollm3(?!\d)", re.IGNORECASE),
@@ -118,7 +123,11 @@ def evaluate(source: SourceModel, settings: Settings) -> Verdict:
 
     output_repo = naming.output_repo(source.id, settings.hub_org, settings.repo_suffix)
     app_token = naming.app_family(naming.app_model_name(output_repo, "x.pte"))
-    if family is not None and app_token is not None:
+    if family is not None and app_token is None:
+        # The app reads the chat template from the name, so a file it cannot place is a file
+        # it refuses to load after the download. LFM2 without the .5 is the live case.
+        reasons.append(f"{source.id!r} reads as no app family, so the app could not render it")
+    elif family is not None and app_token is not None:
         if app_token not in FAMILY_APP_TOKENS.get(family.key, set()):
             reasons.append(f"name reads as app family {app_token!r}, architecture is {family.key!r}")
         elif not FAMILY_NAME_PATTERNS[family.key].search(name):
