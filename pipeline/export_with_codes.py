@@ -43,6 +43,11 @@ def inject(model, codes: dict, log=print) -> tuple[int, list[str]]:
             raise ValueError(f"{fqn}: scales are {tuple(scale.shape)}, the tensor is {tuple(weight.scale.shape)}")
         # XNNPACK's blockwise int4 format carries no sign on the scale and no code outside
         # -8..7; a file that breaks either loads and computes something else.
+        # Finiteness is checked separately because `inf > 0` is True: a positivity test alone
+        # waves through an infinite or NaN scale, which bf16 stores happily and which makes
+        # every weight in that group inf or NaN at runtime (Codex review, 2026-09-19).
+        if not bool(scale.isfinite().all()):
+            raise ValueError(f"{fqn}: a scale is not finite")
         if not bool((scale > 0).all()):
             raise ValueError(f"{fqn}: a scale is not positive")
         if int(qdata.min()) < -8 or int(qdata.max()) > 7:

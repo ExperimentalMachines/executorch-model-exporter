@@ -126,3 +126,27 @@ def test_injection_checks_the_grid_before_writing():
     off_grid = {"linear": {"qdata": torch.full((4, 32), 9, dtype=torch.int8), "scale": torch.ones(4, 1)}}
     with pytest.raises(ValueError, match="int4 grid"):
         export_with_codes.inject(Module(), off_grid)
+
+
+def test_injection_refuses_a_scale_that_is_not_finite():
+    # `inf > 0` is True, so a positivity check alone passes an infinite scale straight
+    # through; bf16 stores it, and every weight in that group is inf at runtime.
+    from pipeline import export_with_codes
+
+    class Weight:
+        def __init__(self):
+            self.qdata = torch.zeros(4, 32, dtype=torch.int8)
+            self.scale = torch.ones(4, 1)
+            self.zero_point = torch.zeros(4, 1)
+
+    class Module:
+        def __init__(self):
+            self.weight = Weight()
+
+        def named_modules(self):
+            return [("linear", self)]
+
+    for bad in (torch.full((4, 1), float("inf")), torch.full((4, 1), float("nan"))):
+        codes = {"linear": {"qdata": torch.zeros(4, 32, dtype=torch.int8), "scale": bad}}
+        with pytest.raises(ValueError, match="not finite"):
+            export_with_codes.inject(Module(), codes)
