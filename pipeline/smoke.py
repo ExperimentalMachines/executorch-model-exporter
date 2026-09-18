@@ -144,9 +144,15 @@ def run(
     problems = []
     try:
         pieces, stats = generate(pte, tokenizer, prompt, max_new_tokens)
-    except RuntimeError as error:  # the runner reports load/generation failures this way
+    except Exception as error:
+        # The runner is C++ behind pybind11, which maps its exceptions onto whichever Python
+        # type matches: std::runtime_error to RuntimeError, but std::out_of_range to
+        # IndexError and std::invalid_argument to ValueError. Catching one of them let an
+        # `IndexError: stoi` from the tokenizer kill the export job outright instead of
+        # being recorded as a failed smoke test (2026-09-19, SmolLM2-135M on an ARM runner).
+        # A smoke test that cannot run is a result about the file, not a crash of the tool.
         pieces, stats = [], {}
-        problems.append(f"runner error: {error}")
+        problems.append(f"runner error: {type(error).__name__}: {error}")
     text = "".join(pieces)
     answered = chat.EXPECTED in text.lower()
     required = total_params >= ANSWER_REQUIRED_FROM_PARAMS
