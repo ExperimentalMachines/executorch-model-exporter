@@ -297,24 +297,48 @@ def sequences(generate, tokenizer, log=print) -> list[tuple[list[int], int]]:
     ``keep_from`` are in the sequence -- the row would not be the app's distribution without
     them -- but are not accumulated into any Hessian after the first row that carries them.
     """
-    head_ids = tokenizer(app_head(tokenizer), add_special_tokens=False)["input_ids"]
+    head = app_head(tokenizer)
+    head_ids = tokenizer(head, add_special_tokens=False)["input_ids"]
     rows: list[tuple[list[int], int]] = []
+    empty = 0
     seen_head = False
     for index, (text, head_chars) in enumerate(build(tokenizer)):
+        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
         limit = MAX_PROMPT_TOKENS + len(head_ids) if head_chars else MAX_PROMPT_TOKENS
-        ids = tokenizer(text, add_special_tokens=False)["input_ids"][:limit]
+        if len(ids) > limit:
+            # Not truncated: the chat template puts the assistant's turn opener at the very
+            # end, so cutting the tail would take it off and the teacher would continue the
+            # user's sentence instead of answering. Every committed row is far inside this,
+            # so reaching here means the corpus or the template changed and wants looking at.
+            raise ValueError(
+                f"calibration row {index} renders to {len(ids)} tokens, over the {limit} limit; "
+                "shorten the question rather than letting it be cut, which would remove the "
+                "generation prompt the reply depends on"
+            )
         keep_from = 0
         if head_chars:
             if ids[: len(head_ids)] != head_ids:
-                raise ValueError(f"row {index} does not open with the declared head")
+                raise ValueError(
+                    f"calibration row {index} does not open with the declared head. The head is "
+                    "tokenised on its own and the row as a whole, so a tokenizer that merges the "
+                    "last head token with the first question token lands here; give this family a "
+                    "head that ends on a boundary the template already breaks at"
+                )
             keep_from = len(head_ids) if seen_head else 0
             seen_head = True
         reply = generate(ids, APP_REPLY_TOKENS if head_chars else MAX_REPLY_TOKENS)
+        empty += not len(reply)
         rows.append((list(ids) + list(reply), keep_from))
         log(
             f"calibration row {index + 1}/{len(SEARCH_ROWS) + len(KNOWN_ROWS) + len(PROMPTS)}: "
             f"{len(ids)} prompt + {len(reply)} reply tokens, counting from {keep_from}"
         )
+    if empty > len(rows) // 2:
+        # The replies are most of what the solve protects. A teacher that emits EOS at once
+        # leaves a corpus of prompts, which is the thing this module exists not to be.
+        raise ValueError(f"{empty} of {len(rows)} calibration rows came back with no reply at all")
+    if empty:
+        log(f"==> warning: {empty} rows generated no reply")
     counted = sum(len(ids) - keep for ids, keep in rows)
     log(f"==> {len(rows)} calibration rows, {counted} counted positions")
     return rows

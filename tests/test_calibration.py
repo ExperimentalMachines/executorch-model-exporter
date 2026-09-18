@@ -136,3 +136,24 @@ def test_counting_the_head_every_time_would_have_changed_the_answer():
     a = solve.solve_model(copy.deepcopy(model), counted_once, log=lambda *_: None)
     b = solve.solve_model(copy.deepcopy(model), counted_always, log=lambda *_: None)
     assert any(not torch.equal(a[n]["qdata"], b[n]["qdata"]) for n in a)
+
+
+def test_a_row_too_long_for_the_limit_is_refused_not_cut():
+    # Cutting the tail would take off the chat template's generation prompt, and the teacher
+    # would continue the user's sentence instead of answering it. That reply would then be
+    # most of what the solve protects.
+    tok = FakeTokenizer()
+    long_question = ("x" * 4000, "subject")
+    original = calibration.SEARCH_ROWS
+    calibration.SEARCH_ROWS = (long_question,)
+    try:
+        with pytest.raises(ValueError, match="over the"):
+            calibration.sequences(constant_reply, tok, log=lambda *_: None)
+    finally:
+        calibration.SEARCH_ROWS = original
+
+
+def test_a_teacher_that_says_nothing_is_refused():
+    tok = FakeTokenizer()
+    with pytest.raises(ValueError, match="no reply at all"):
+        calibration.sequences(lambda ids, n: [], tok, log=lambda *_: None)
