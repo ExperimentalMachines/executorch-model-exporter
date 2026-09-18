@@ -110,6 +110,7 @@ def run(
     keep_work: bool = False,
     skip_smoke: bool = False,
     backend: str = BACKEND,
+    codes: Path | None = None,
 ) -> dict:
     if backend not in BACKEND_CONFIG:
         raise ExportError(f"unknown backend {backend!r}; this exporter builds {sorted(BACKEND_CONFIG)}")
@@ -180,14 +181,29 @@ def run(
     config_path = work_dir / "export_llm.yaml"
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
-    print("==> export_llm")
+    # With solved codes, the same export runs through a wrapper that replaces torchao's
+    # rounding with them; without, export_llm is called directly, as before.
+    if codes is not None:
+        command = [
+            sys.executable,
+            "-m",
+            "pipeline.export_with_codes",
+            "--config",
+            str(config_path),
+            "--codes",
+            str(codes),
+        ]
+        print(f"==> export_llm with calibrated codes from {codes}")
+    else:
+        command = [sys.executable, "-m", "executorch.extension.llm.export.export_llm", "--config", str(config_path)]
+        print("==> export_llm")
     export_started = time.time()
     with MemorySampler() as memory:
         run_tool(
-            [sys.executable, "-m", "executorch.extension.llm.export.export_llm", "--config", str(config_path)],
+            command,
             "export_llm",
             cwd=work_dir,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONPATH": str(Path(__file__).resolve().parent.parent)},
         )
     export_seconds = time.time() - export_started
     if not pte.exists():
@@ -241,6 +257,7 @@ def run(
             "group_size": recipe.group_size,
             "embedding_quantize": recipe.embedding_quantize,
             "embedding_hqq": recipe.embedding_hqq,
+            "int4_codes": "gptq" if codes is not None else "round-to-nearest",
             "prefill_chunk": min(cfg.prefill_chunk, window),
             "kv_cache_dtype": "fp32",
             "label": f"{recipe.qmode}-g{recipe.group_size}, int8 embeddings",

@@ -1,0 +1,259 @@
+"""GPTQ onto the grid XNNPACK runs: symmetric int4, groups of 32, positive bf16 scales.
+
+ExecuTorch has no calibrated int4 path to this delegate (pytorch/executorch #3632 and
+#9846, both open): ``8da4w-gptq`` is accepted and refused, and torchao's own GPTQ writes
+weight-only formats the delegate cannot lower. The delegate does not care who chose the
+codes, though, so they are solved here on the eager module ``export_llm`` traces and written
+into torchao's tensors before lowering. Same file format, same kernels, same size; different
+rounding.
+
+Why it earns a stage. Round to nearest is what every published export used, and on the
+LFM2.5 family it costs the model its tool calling: on 141 held-out questions the rounded
+1.2B export searched when needed on 10 percent of the questions that needed it and spoke of
+search results it had never fetched in a quarter of its replies, where the solved export
+reads 49 and 1 percent (finding 29). Attention-only families lose much less, so this is an
+improvement for them rather than a repair.
+
+The method, per layer in order, with everything upstream already quantised so each layer is
+solved on the inputs it will really see: the Hessian of every int4 linear is accumulated
+from its input after the per-token int8 rounding the delegate applies, the weight is solved
+column by column with the error pushed onto the columns not yet rounded (Frantar et al.,
+arXiv 2210.17323), and each group's scale is the clip that minimises that group's squared
+error at the moment the solver reaches it. No activation reordering: XNNPACK's groups are
+contiguous.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+# The clip grid each group's scale is chosen from, widest first.
+CLIPS = (1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6)
+# int4, symmetric: the largest magnitude a code can carry is 7.5 half-steps from zero.
+INT4_HALF_RANGE = 7.5
+GROUP = 32
+
+
+def bf16_storage(scale):
+    """What the delegate keeps of a blockwise scale.
+
+    ExecuTorch 1.4 writes block scales into the .pte as bf16, rounded to nearest
+    (backends/xnnpack/operators/node_visitor.py, ``scale.to(torch.bfloat16)``): eight bits
+    of mantissa, so up to 0.39 percent either way. Solving against a scale the file cannot
+    store would leave the codes matched to a weight the runtime never sees.
+    """
+    return scale.detach().to(_torch().bfloat16).to(_torch().float32)
+
+
+def fake_act(x, bits: int = 8):
+    """The per-token asymmetric int8 rounding the delegate applies to activations."""
+    torch = _torch()
+    qmin, qmax = -(2 ** (bits - 1)), 2 ** (bits - 1) - 1
+    lo = torch.clamp(x.amin(-1, keepdim=True), max=0.0)
+    hi = torch.clamp(x.amax(-1, keepdim=True), min=0.0)
+    scale = torch.clamp((hi - lo) / (qmax - qmin), min=torch.finfo(torch.float32).eps)
+    zero = torch.clamp(qmin - torch.round(lo / scale), qmin, qmax)
+    q = torch.clamp(torch.round(x / scale) + zero, qmin, qmax)
+    return (q - zero) * scale
+
+
+def _torch():
+    import torch
+
+    return torch
+
+
+def group_scale(w):
+    """The symmetric int4 scale per row of one group, by squared error over the clip grid."""
+    torch = _torch()
+    amax = w.abs().amax(1, keepdim=True).clamp(min=1e-8)
+    best = best_err = None
+    for clip in CLIPS:
+        scale = bf16_storage(amax * clip / INT4_HALF_RANGE)
+        err = ((torch.clamp(torch.round(w / scale), -8, 7) * scale - w) ** 2).sum(1, keepdim=True)
+        if best is None:
+            best, best_err = scale, err
+        else:
+            better = err < best_err
+            best = torch.where(better, scale, best)
+            best_err = torch.where(better, err, best_err)
+    return best
+
+
+def solve_weight(weight, hessian, group: int = GROUP, damp: float = 0.01, block: int = 128):
+    """GPTQ for one linear: returns int4 codes and their per-group scales."""
+    torch = _torch()
+    device = weight.device
+    w = weight.clone().to(torch.float32)
+    out_f, in_f = w.shape
+    if group <= 0:
+        raise ValueError(f"group must be positive, got {group}")
+    if in_f % group:
+        raise ValueError(f"in_features={in_f} is not divisible by group={group}")
+
+    # Factored in fp64 on the CPU, on a copy: the caller's Hessian is not touched.
+    h = hessian.detach().cpu().to(torch.float64).clone()
+    dead = torch.diag(h) == 0
+    h[dead, dead] = 1
+    w[:, dead.to(device)] = 0
+    h = h + torch.eye(in_f, dtype=h.dtype) * (damp * torch.diag(h).mean())
+    chol = torch.linalg.cholesky(h)
+    hinv = torch.linalg.cholesky(torch.cholesky_inverse(chol), upper=True).to(torch.float32).to(device)
+
+    codes = torch.zeros(out_f, in_f, dtype=torch.int8, device=device)
+    scales = torch.zeros(out_f, in_f // group, device=device)
+    for b0 in range(0, in_f, block):
+        b1 = min(b0 + block, in_f)
+        wb = w[:, b0:b1].clone()
+        eb = torch.zeros_like(wb)
+        hb = hinv[b0:b1, b0:b1]
+        for i in range(b1 - b0):
+            col = b0 + i
+            if col % group == 0:
+                end = col + group
+                local_end = min(end, b1)
+                wg = wb[:, i : i + (local_end - col)]
+                if local_end < end:
+                    wg = torch.cat((wg, w[:, local_end:end]), dim=1)
+                scales[:, col // group] = group_scale(wg)[:, 0]
+            scale = scales[:, col // group]
+            column = wb[:, i]
+            q = torch.clamp(torch.round(column / scale), -8, 7)
+            codes[:, col] = q.to(torch.int8)
+            err = (column - q * scale) / hb[i, i]
+            wb[:, i:] -= err.unsqueeze(1) * hb[i, i:].unsqueeze(0)
+            eb[:, i] = err
+        w[:, b1:] -= eb @ hinv[b0:b1, b1:]
+    return codes.cpu(), scales.cpu()
+
+
+def dequantise(codes, scales, group: int = GROUP):
+    """The weight the delegate will actually compute with."""
+    torch = _torch()
+    rows = codes.shape[0]
+    return (codes.to(torch.float32).reshape(rows, -1, group) * scales.to(torch.float32).unsqueeze(-1)).reshape(
+        codes.shape
+    )
+
+
+def eager_model(model_class: str, params: dict, checkpoint: Path, work_dir: Path, max_seq_len: int = 2048):
+    """The module ``export_llm`` traces, in fp32 with no KV cache.
+
+    Built through the same entry point the exporter uses, so the linears solved here are the
+    ones lowered later; a different construction would solve a different model.
+    """
+    torch = _torch()
+    from executorch.examples.models.llama.model import Llama2Model
+    from executorch.extension.llm.export.config.llm_config import LlmConfig, ModelType
+
+    params_path = work_dir / "solve-params.json"
+    params_path.write_text(json.dumps(params))
+    cfg = LlmConfig()
+    cfg.base.model_class = ModelType(model_class)
+    cfg.base.params = str(params_path)
+    cfg.base.checkpoint = str(checkpoint)
+    cfg.model.use_kv_cache = False
+    cfg.model.use_sdpa_with_kv_cache = False
+    cfg.model.dtype_override = "fp32"
+    cfg.export.max_seq_length = max_seq_len
+    cfg.export.max_context_length = max_seq_len
+    return Llama2Model(cfg).get_eager_model().to(torch.float32).eval()
+
+
+def int4_linears(model) -> dict:
+    """Every linear the 8da4w recipe puts at int4: the layers, and the output head.
+
+    The head is included because leaving it out is a silent choice: it is the tied
+    embedding's copy and a ninth of LFM2.5's weights, and every solve before 2026-09-18
+    stopped at the last layer without saying so (finding 29).
+    """
+    from torch import nn
+
+    found = {}
+    for index, layer in enumerate(model.layers):
+        for name, module in layer.named_modules():
+            if isinstance(module, nn.Linear):
+                found[f"layers.{index}.{name}"] = module
+    head = getattr(model, "output", None)
+    if isinstance(head, nn.Linear):
+        found["output"] = head
+    return found
+
+
+def solve_model(model, sequences, damp: float = 0.01, act_quant: bool = True, log=print) -> dict:
+    """Solve every int4 linear, layer by layer, and return ``name -> {qdata, scale}``."""
+    torch = _torch()
+    from torch import nn
+
+    class _Stop(Exception):
+        pass
+
+    captured: list = []
+
+    def grab(module, args, kwargs):
+        captured.append((args, kwargs))
+        raise _Stop
+
+    handle = model.layers[0].register_forward_pre_hook(grab, with_kwargs=True)
+    with torch.no_grad():
+        for seq in sequences:
+            try:
+                model(torch.tensor([seq], dtype=torch.long))
+            except _Stop:
+                pass
+    handle.remove()
+    hidden = [call[0][0] for call in captured]
+
+    codes: dict = {}
+    started = time.time()
+    with torch.no_grad():
+        for index, layer in enumerate(model.layers):
+            prefix = f"layers.{index}."
+            linears = {n: m for n, m in layer.named_modules() if isinstance(m, nn.Linear)}
+            hess = {n: torch.zeros(m.weight.shape[1], m.weight.shape[1]) for n, m in linears.items()}
+            counts = dict.fromkeys(linears, 0)
+            hooks = []
+            for name, module in linears.items():
+
+                def accumulate(mod, args, name=name, hess=hess, counts=counts):
+                    x = args[0].reshape(-1, args[0].shape[-1])
+                    if act_quant:
+                        x = fake_act(x)
+                    hess[name] += x.T @ x
+                    counts[name] += x.shape[0]
+
+                hooks.append(module.register_forward_pre_hook(accumulate))
+            for i, (args, kwargs) in enumerate(captured):
+                layer(hidden[i], *args[1:], **kwargs)
+            for hook in hooks:
+                hook.remove()
+
+            for name, module in linears.items():
+                q, s = solve_weight(module.weight.data, hess[name] / max(counts[name], 1), damp=damp)
+                codes[prefix + name] = {"qdata": q, "scale": s}
+                module.weight.data = dequantise(q, s)
+                if act_quant:
+                    module.register_forward_pre_hook(lambda mod, args: (fake_act(args[0]),))
+            del hess
+            for i, (args, kwargs) in enumerate(captured):
+                out = layer(hidden[i], *args[1:], **kwargs)
+                hidden[i] = out[0] if isinstance(out, tuple | list) else out
+            log(f"layer {index} solved, {time.time() - started:.0f}s")
+
+        head = getattr(model, "output", None)
+        if isinstance(head, nn.Linear):
+            width = head.weight.shape[1]
+            hess_head = torch.zeros(width, width)
+            positions = 0
+            for state in hidden:
+                x = model.norm(state).reshape(-1, width)
+                if act_quant:
+                    x = fake_act(x)
+                hess_head += x.T @ x
+                positions += x.shape[0]
+            q, s = solve_weight(head.weight.data, hess_head / max(positions, 1), damp=damp)
+            codes["output"] = {"qdata": q, "scale": s}
+            log(f"output head solved, {time.time() - started:.0f}s")
+    return codes
