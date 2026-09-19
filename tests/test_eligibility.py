@@ -1,3 +1,4 @@
+import pytest
 from conftest import hf_config, make_source
 
 from pipeline import eligibility, settings
@@ -113,3 +114,25 @@ def test_variant():
     assert eligibility.variant("Qwen/Qwen2.5-1.5B-Instruct", "qwen2_5") == "instruct"
     assert eligibility.variant("google/gemma-3-1b-it", "gemma3") == "instruct"
     assert eligibility.variant("meta-llama/Llama-3.2-1B", "llama") == "base"
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        # LFM2.5 is uneven: the 1.2B names its chat model, the 2.6B does not.
+        ("LiquidAI/LFM2.5-1.2B-Instruct", "instruct"),
+        ("LiquidAI/LFM2.5-1.2B-Base", "base"),
+        ("LiquidAI/LFM2.5-2.6B", "instruct"),
+        ("LiquidAI/LFM2.5-2.6B-Base", "base"),
+        # An abliterated copy keeps whatever it was abliterated from.
+        ("experimentalmachines/LFM2.5-2.6B-heretic", "instruct"),
+        ("experimentalmachines/LFM2.5-1.2B-Instruct-heretic", "instruct"),
+    ],
+)
+def test_lfm2_chat_models_are_not_read_as_base(model_id, expected):
+    """LFM2.5-2.6B is the instruct model; LFM2.5-2.6B-Base is the base.
+
+    Reading the bare name as a base model made the smoke test prompt a chat model with a
+    completion string and recorded "base" in every published report for it.
+    """
+    assert eligibility.variant(model_id, "lfm2") == expected

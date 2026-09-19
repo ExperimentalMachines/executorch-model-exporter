@@ -33,6 +33,11 @@ FAMILY_NAME_PATTERNS = {
     "smollm3": re.compile(r"smollm3(?!\d)", re.IGNORECASE),
 }
 _INSTRUCT_TOKENS = {"instruct", "it", "chat"}
+# Families whose chat models ship with no suffix at all and whose base models carry "-Base".
+# Qwen3 does this throughout. LFM2.5 does it unevenly: the 1.2B is LFM2.5-1.2B-Instruct
+# against LFM2.5-1.2B-Base, but the 2.6B is plain LFM2.5-2.6B against LFM2.5-2.6B-Base, so
+# reading the bare name as a base model gets that one backwards.
+_CHAT_WITHOUT_A_SUFFIX = {"qwen3", "lfm2"}
 
 
 @dataclass
@@ -70,8 +75,7 @@ def variant(model_id: str, family: str | None) -> str:
     tokens = set(re.split(r"[-_.]", naming.source_name(model_id).lower()))
     if tokens & _INSTRUCT_TOKENS:
         return "instruct"
-    # Qwen3 ships its chat models without a suffix and marks the others "-Base".
-    if family == "qwen3" and "base" not in tokens:
+    if family in _CHAT_WITHOUT_A_SUFFIX and "base" not in tokens:
         return "instruct"
     return "base"
 
