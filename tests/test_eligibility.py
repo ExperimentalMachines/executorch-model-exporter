@@ -19,9 +19,11 @@ def test_qwen3_goes_to_every_backend():
 
 
 def test_qnn_needs_an_entry_in_executorchs_qualcomm_registry():
-    # Same architecture, but ExecuTorch 1.4.0's Qualcomm scripts only list Qwen/Qwen3-1.7B.
-    # The MediaTek scripts build any Qwen3 from its config.json.
-    verdict = evaluate("Qwen/Qwen3-1.7B-Base", config=hf_config("Qwen/Qwen3-1.7B"))
+    # Same architecture, but ExecuTorch 1.4.0's Qualcomm scripts only list Qwen3-0.6B and
+    # Qwen3-1.7B. The MediaTek scripts build any Qwen3 from its config.json.
+    # Qwen3-4B rather than Qwen3-1.7B-Base: a base checkpoint is now refused outright, which
+    # would make this pass for the wrong reason (no backends at all, rather than no QNN).
+    verdict = evaluate("Qwen/Qwen3-4B", config=hf_config("Qwen/Qwen3-1.7B"))
     assert verdict.export_backends == ["xnnpack", "vulkan", "mtk"]
     assert "no entry" in verdict.backends["qnn"]
 
@@ -136,3 +138,18 @@ def test_lfm2_chat_models_are_not_read_as_base(model_id, expected):
     completion string and recorded "base" in every published report for it.
     """
     assert eligibility.variant(model_id, "lfm2") == expected
+
+
+def test_base_checkpoints_are_not_published():
+    """Only chat models. The app renders a template from the name and refuses a file it
+    cannot place, so a completion model in a chat app reads as a broken chat model."""
+    verdict = evaluate("Qwen/Qwen3-1.7B-Base", config=hf_config("Qwen/Qwen3-1.7B"))
+    assert not verdict.eligible
+    assert any("base checkpoint" in r for r in verdict.reasons)
+    assert verdict.variant == "base"
+
+
+def test_a_chat_model_named_without_a_suffix_is_still_published():
+    # The other half of the rule: Qwen3 and LFM2.5-2.6B ship chat models with no suffix, and
+    # refusing "base" by name alone would drop them.
+    assert evaluate("Qwen/Qwen3-1.7B").eligible

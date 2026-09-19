@@ -13,7 +13,8 @@ from pipeline import eligibility, naming, settings
         ("SmolLM2-360M-Instruct", "smollm2"),
         ("gemma-3-1b-it", "gemma3"),
         ("LFM2.5-VL-1.6B", "lfm25"),
-        ("Qwen3.5-2B", None),
+        # The app has had Qwen35Template since 2026-09; it is a family, not an exclusion.
+        ("Qwen3.5-2B", "qwen35"),
         ("Qwen2.5-VL-3B-Instruct", None),
         ("Qwen2.5-Coder-1.5B-Instruct", None),
         ("Llama-Guard-3-1B", None),
@@ -87,7 +88,9 @@ def test_app_rule_violations_are_reported():
     problems = naming.check_app_rules("someone/Qwen3-1.7B-XNNPACK", "qnn/sm8650/model.pte", "qnn")
     assert any("contains 'xnnpack'" in p for p in problems)
     assert any("reads as backend 'xnnpack'" in p for p in problems)
-    assert naming.check_app_rules("someone/Qwen3.5-2B-ExecuTorch", "xnnpack/a.pte", "xnnpack")
+    # A name the app genuinely cannot place: "vl" is excluded there and here, so a vision
+    # export must not pass the rules even though its family token would otherwise match.
+    assert naming.check_app_rules("someone/Qwen3.5-VL-2B-ExecuTorch", "xnnpack/a.pte", "xnnpack")
 
 
 def test_names_with_several_or_no_sizes_are_refused_by_name():

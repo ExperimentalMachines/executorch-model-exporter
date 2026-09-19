@@ -15,6 +15,10 @@ from __future__ import annotations
 import re
 
 APP_FAMILY_TOKENS = (
+    # Order matters, exactly as it does in the app: "qwen3" is a prefix of "qwen35", which
+    # is a different family with a different template, so it has to be tried first
+    # (PromptTemplates.forModel).
+    "qwen35",
     "qwen3",
     "qwen25",
     "smollm2",
@@ -24,7 +28,10 @@ APP_FAMILY_TOKENS = (
     "gemma3",
     "lfm25",
 )
-APP_EXCLUDED = ("vl", "vision", "coder", "guard", "qwen35")
+# Mirrors PromptTemplates.EXCLUDED in the app. "qwen35" was here while the app had no
+# template for it; the app has had Qwen35Template since, and keeping the refusal meant this
+# repository skipped a family the app can run.
+APP_EXCLUDED = ("vl", "vision", "coder", "guard")
 _KEPT_PUNCTUATION = "-_."
 _SIZE_HINT = re.compile(r"(?<![A-Za-z0-9.])\d+(\.\d+)?[BM](?![A-Za-z0-9])", re.IGNORECASE)
 

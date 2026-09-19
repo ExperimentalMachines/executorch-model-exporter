@@ -111,6 +111,11 @@ def evaluate(source: SourceModel, settings: Settings) -> Verdict:
 
     if source.pipeline_tag not in (None, settings.pipeline_tag):
         reasons.append(f"pipeline tag {source.pipeline_tag!r} is not {settings.pipeline_tag!r}")
+    if verdict.variant == "base":
+        # Base checkpoints are not published. They have no chat template, so the app -- which
+        # renders one from the name and refuses a file it cannot place -- cannot run them,
+        # and a completion model in a chat app reads as a broken chat model.
+        reasons.append(f"{name!r} is a base checkpoint, and only chat models are published")
     reasons.extend(name_reasons(source.id, settings))
     if source.access_error:
         reasons.append(source.access_error)
