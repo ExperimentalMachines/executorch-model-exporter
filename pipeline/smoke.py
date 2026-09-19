@@ -15,6 +15,14 @@ from pipeline import chat
 _METADATA_PREFIXES = ("get_", "use_", "enable_")
 # Below this size a model may not know the answer; only degenerate output fails it.
 ANSWER_REQUIRED_FROM_PARAMS = 500_000_000
+# Room for a model that reasons before it answers. This was 32, which is fine for a model
+# that replies "Paris" and stops, and fails one that thinks first: LFM2.5-2.6B spends about
+# 30 tokens working out that the answer is one word before writing it, and stops at 110
+# (measured on the fp32 model, 2026-09-19). At 32 the reply was still mid-sentence and the
+# smoke test failed a file that works -- every window of LFM2.5-2.6B-heretic, run
+# 35408948368. The cap only bounds the check; `degenerate` still catches a file that
+# repeats, so the cost of a larger budget is a few seconds per window.
+MAX_NEW_TOKENS = 128
 
 
 def _plain(value):
@@ -133,7 +141,7 @@ def run(
     tokenizer_config: dict,
     instruct: bool,
     total_params: int,
-    max_new_tokens: int = 32,
+    max_new_tokens: int = MAX_NEW_TOKENS,
 ) -> dict:
     template_error = None
     try:
