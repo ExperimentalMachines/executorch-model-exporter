@@ -177,7 +177,14 @@ jobs:
     # on aarch64 (finding 30), so this is the one job that has to be x86; it loads the .pte
     # the export built and asks the same question through the same C++ runner the app uses.
     needs: [targets, export]
-    if: ${{ always() && needs.export.result == 'success' }}
+    # Not `needs.export.result == 'success'`: the export matrix is fail-fast: false so that
+    # one window standing on its own, and gating the whole verify matrix on every window
+    # having succeeded threw that away. Qwen/Qwen3-1.7B lost a 32k export to a terminated
+    # runner in run 35413952925, and the four windows that had built correctly were never
+    # verified and never published because of it. Each verify job already stands down on
+    # its own when its window uploaded no artifact, which is the per-window check this
+    # should have relied on all along.
+    if: ${{ always() && needs.targets.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
