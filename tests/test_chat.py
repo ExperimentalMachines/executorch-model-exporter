@@ -62,3 +62,24 @@ def test_a_template_the_sandbox_cannot_compile_still_carries_bos(tmp_path):
     with pytest.raises(TemplateSyntaxError):
         chat.render(tmp_path, config, instruct=True)
     assert chat.render(tmp_path, config, instruct=False).startswith("<|startoftext|>")
+
+
+def test_bos_is_not_doubled_when_the_template_writes_it_late(tmp_path, monkeypatch):
+    """A template that opens with whitespace renders BOS in second place, not first.
+
+    Measured on a real tokenizer: the prompt came back with two <|begin_of_text|> tokens,
+    a sequence no model is trained on.
+    """
+    monkeypatch.setattr(chat, "_render_with_transformers", lambda d: "\n<s>hello")
+    assert chat.render(tmp_path, {"bos_token": "<s>"}, instruct=True) == "\n<s>hello"
+
+
+def test_bos_is_added_when_the_template_omits_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(chat, "_render_with_transformers", lambda d: "hello")
+    assert chat.render(tmp_path, {"bos_token": "<s>"}, instruct=True) == "<s>hello"
+
+
+def test_a_family_with_no_bos_gets_none_added(tmp_path, monkeypatch):
+    # Qwen has no BOS at all; inventing one would be as wrong as dropping LFM2.5's.
+    monkeypatch.setattr(chat, "_render_with_transformers", lambda d: "<|im_start|>user")
+    assert chat.render(tmp_path, {}, instruct=True) == "<|im_start|>user"

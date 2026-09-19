@@ -84,8 +84,13 @@ def render(model_dir: Path, tokenizer_config: dict, instruct: bool) -> str:
         rendered = _render_with_transformers(model_dir)
         if rendered is not None:
             # apply_chat_template may or may not have written BOS itself; the runtime adds
-            # none, so it has to be in the text exactly once.
-            return rendered if not bos or rendered.startswith(bos) else bos + rendered
+            # none, so it has to be in the text exactly once. The test is whether the token
+            # is present, not whether it is first: a template that opens with a newline and
+            # then {{ bos_token }} renders BOS in second place, and asking startswith() put
+            # a second one in front of it (Codex review, 2026-09-19). Two BOS tokens is a
+            # sequence the model never saw in training, which degrades it quietly -- the
+            # same shape of fault as the missing BOS this function was fixed for.
+            return rendered if not bos or bos in rendered else bos + rendered
     template = _template(model_dir, tokenizer_config) if instruct else None
     if template is None:
         # BOS unconditionally: see the module docstring. Gating it on add_bos_token cost a
