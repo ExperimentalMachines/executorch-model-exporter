@@ -75,3 +75,25 @@ def test_the_gate_never_grades_a_question_the_solve_calibrated_on():
     calibrated = {q for q, _ in calibration.SEARCH_ROWS} | set(calibration.KNOWN_ROWS) | set(calibration.PROMPTS)
     graded = {q for q, _ in gate.SEARCH} | set(gate.QUIET)
     assert not (calibrated & graded)
+
+
+def test_a_model_that_never_calls_is_marked_as_unmeasured():
+    """LFM2.5-2.6B answers "The" at probability 1.0 to every row, trailered or not.
+
+    Its export still has to track its fp32 model and does, so this is a pass. But the gate
+    checked nothing about tool calling, and a verdict that did not say so would be read as
+    if it had.
+    """
+    rows = {q: {"token": 2, "p": 1.0, "text": "The"} for q, _ in gate.SEARCH}
+    rows.update({q: {"token": 2, "p": 1.0, "text": "The"} for q in gate.QUIET})
+    ref = {"rows": rows, "confident": len(rows)}
+    measured = {q: {"p": 1.0, "top": 2} for q in rows}
+    verdict = gate.check(ref, measured)
+    assert verdict["passed"]
+    assert verdict["measures_tool_calling"] is False
+
+
+def test_a_model_that_does_call_is_marked_as_measured():
+    verdict = gate.check(reference(), measured(0.80, len(gate.SEARCH)))
+    assert verdict["passed"]
+    assert verdict["measures_tool_calling"] is True

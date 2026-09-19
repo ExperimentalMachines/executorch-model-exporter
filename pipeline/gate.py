@@ -163,6 +163,14 @@ def check(ref: dict, measured: dict) -> dict:
     # A quiet row is one where fp32 answers instead of calling. The export must do the same:
     # picking fp32's token there means it answered, and any other top token is worth seeing.
     quiet_followed = sum(1 for q in QUIET if measured[q]["top"] == ref["rows"][q]["token"])
+    # Whether this model tool-calls at all. LFM2.5-2.6B answers "The" at probability 1.0 to
+    # every row here, trailered or not: it is not tool-trained, so fp32's chosen token is the
+    # same on the search rows as on the quiet ones and the gate cannot see a tool-calling
+    # regression in it. That is not a failure -- the export still has to track fp32, and it
+    # does -- but a verdict that said nothing about it would be read as if it had.
+    quiet_tokens = {ref["rows"][q]["token"] for q in QUIET}
+    calls = sum(1 for q in search if ref["rows"][q]["token"] not in quiet_tokens)
+    informative = calls >= len(search) // 2
 
     problems = []
     if fp32_mean - export_mean > MAX_SHORTFALL:
@@ -186,6 +194,7 @@ def check(ref: dict, measured: dict) -> dict:
         "agreed": agreed,
         "shortfall": round(fp32_mean - export_mean, 4),
         "quiet_rows_answered_like_fp32": quiet_followed,
+        "measures_tool_calling": informative,
         "quiet_rows": len(QUIET),
         "fp32_undecided_rows": undecided,
         "rows": {

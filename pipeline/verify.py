@@ -81,6 +81,12 @@ def run(out_dir: Path, backend: str, work_dir: Path, gate_reference: Path | None
                 f"    fp32 {verdict['fp32_mean']} against the export's {verdict['export_mean']} "
                 f"on {verdict['graded']} rows, same choice on {verdict['agreed']}"
             )
+            if not verdict.get("measures_tool_calling", True):
+                print(
+                    "    note: this model answers the tool-shaped rows the same way it answers "
+                    "the quiet ones, so the gate checked that the export tracks its fp32 model "
+                    "and not that it still calls tools"
+                )
             report["gate"] = verdict
             gates.append(verdict)
 
