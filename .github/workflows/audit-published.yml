@@ -1,0 +1,79 @@
+name: Audit published
+run-name: "Audit: ${{ inputs.models }}"
+
+# Twelve models were published before the decision gate existed. Nothing has ever checked
+# that they still decide like the models they were compiled from -- only that they generate,
+# which a file with quietly rounded weights also does. Two of that batch have since been
+# audited and both were degraded (SmolLM2-135M 0.190 and 360M 0.221 against fp32 ~0.58), so
+# the rest are worth asking about. This workflow only reads: it downloads each published
+# .pte, works out what its fp32 source decides on the gate's prompts, and compares. It
+# publishes nothing and writes nothing to the Hub.
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: Space-separated source model ids, e.g. "Qwen/Qwen3-0.6B meta-llama/Llama-3.2-1B-Instruct"
+        required: true
+        type: string
+      context:
+        description: Which window to audit; empty picks any (the gate reads alike on all of them)
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    # x86: the gate runs ExecuTorch's C++ runner through the wheel, which fails on aarch64
+    # the same way the verify job does (finding 30).
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 350
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      MODELS: ${{ inputs.models }}
+      CONTEXT: ${{ inputs.context }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup-export
+      - name: Audit each model
+        shell: bash
+        run: |
+          set -u
+          mkdir -p audit-out
+          failed=0
+          for model in $MODELS; do
+            echo "::group::$model"
+            args=(audit "$model" --work audit-work)
+            [ -n "$CONTEXT" ] && args+=(--context "$CONTEXT")
+            # Keep going after a failure: a degraded file is the finding, not a reason to
+            # stop auditing the rest.
+            if python -m pipeline "${args[@]}" 2>&1 | tee "audit-out/${model//\//_}.txt"; then
+              echo "$model: gate passed"
+            else
+              echo "$model: GATE FAILED OR ERRORED"
+              failed=1
+            fi
+            rm -rf audit-work
+            echo "::endgroup::"
+          done
+          echo "models with a failing or errored gate: $failed"
+      - name: Summarise
+        if: always()
+        shell: bash
+        run: |
+          echo "## Audit results" >>"$GITHUB_STEP_SUMMARY"
+          for f in audit-out/*.txt; do
+            [ -e "$f" ] || continue
+            echo "### $(basename "$f" .txt)" >>"$GITHUB_STEP_SUMMARY"
+            echo '```' >>"$GITHUB_STEP_SUMMARY"
+            tail -25 "$f" >>"$GITHUB_STEP_SUMMARY"
+            echo '```' >>"$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: audit-${{ github.run_id }}
+          path: audit-out/
