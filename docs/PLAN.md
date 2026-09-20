@@ -72,7 +72,16 @@ fits and tells the exporter what the runner can build:
   params counted from the architecture (the output projection always gets its own 4-bit
   copy). Within 1% of every measured file.
 - Export peak ≈ fp32 weights + KV cache + `n_layers × window²` bytes of causal masks +
-  2.5 GB.
+  2.5 GB, **multiplied by `HOST_PEAK_HEADROOM` (1.70) before it is compared to the runner's
+  budget**. The estimate runs under what the runner actually uses: measured against
+  `host.peak_in_use_bytes` in the 24 published export reports that carry both numbers, it
+  is low in 18 of them, median 1.13x, worst 1.70x, and worst at the widest windows
+  (Qwen3-1.7B at 16k: estimated 20.4 GiB, measured 34.7 GiB, finishing with 34 MB of memory
+  to spare). Without the factor Qwen3-1.7B at 32k estimated 44.9 GiB against a 46.5 GiB
+  budget, was attempted, and killed the runner twice (runs 35413952925, 35420508341).
+  Attention-only families are where this bites: that model attends on 28 of 28 layers where
+  LFM2.5-1.2B attends on 6 of 16, which is why the hybrids survive 32k and it does not at
+  half the parameters.
 - `fits_phone_budget` = resident ≤ `device_budget_bytes` (default 5.0 GB), recorded per
   file. Estimated export peak > runner RAM + swap is the one gate: the job exits 4 and the
   workflow records the window as skipped (Qwen3 at 32k on hosted runners, see Known limits).
@@ -223,7 +232,8 @@ calling ExecuTorch's own script in compile-only mode:
    | 32k | — | runner killed (causal masks) | — | — |
 
    `pipeline/sizing.py` is calibrated on these: estimates within 1% of every measured
-   `.pte` and 4-7% above the measured export peaks.
+   `.pte`. The export-peak half of that claim was wrong and is corrected below -- it was
+   read off a handful of small-model probes and does not hold at the windows that matter.
 1. **XNNPACK end to end** (`export-xnnpack.yml`, done 2026-09-12): first publish
    [experimentalmachines/Qwen3-0.6B-ExecuTorch](https://huggingface.co/experimentalmachines/Qwen3-0.6B-ExecuTorch)
    (16k window, smoke test "Paris") and GitHub release `Qwen3-0.6B-xnnpack-c1899de`.
@@ -323,7 +333,17 @@ G5, Dimensity 9300+, Exynos 2500; GSM8K, RetrievalQA, IFEval, PopQA, BFCL, Fresh
   1.4.0's transformer builds its own window × window causal mask (not stored in the
   `.pte`). Qwen3-0.6B at 32k needs 30,064,771,072 bytes of masks alone and killed a
   16.8 GB + 24 GB swap runner; `sizing.export_peak_bytes` counts it and a forced window
-  that cannot fit is refused.
+  that cannot fit is refused. That guard was in place and did not fire for Qwen3-1.7B at
+  32k, because the estimate it gates on was itself too low; see the headroom factor above.
+
+- **Eleven of the sixteen published repositories are round to nearest, not GPTQ**: both
+  Llama-3.2, all four Qwen2.5, Qwen3-0.6B, Qwen3-4B, Qwen3-4B-Instruct-2507 and both
+  SmolLM2. Only the four LFM2.5 repositories and Qwen3-1.7B carry solved codes. Round to
+  nearest is what took LFM2.5's tool-call recall from 49 percent to 10. `python -m pipeline
+  audit <model>` gates a published file against its fp32 source without rebuilding it, so
+  this can be measured without a solve per model; its first run found
+  SmolLM2-135M-Instruct-ExecuTorch failing, at 0.190 against fp32's 0.583 over the four
+  rows fp32 is confident on, with the quiet rows untouched.
 
 - The watcher checks each repo once. A model whose weights change after it was seen
   (a new commit on `main`) is not re-exported automatically: most upstream commits touch
