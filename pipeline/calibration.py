@@ -290,13 +290,22 @@ def extended() -> dict[str, list[str]]:
     removed (1). Set ``OW_CALIB_EXTENDED=1`` to include them, which is how the experiment is
     run; unset, this file behaves exactly as before and the published recipe does not move.
     """
-    if os.environ.get("OW_CALIB_EXTENDED") != "1":
+    mode = os.environ.get("OW_CALIB_EXTENDED", "")
+    if mode not in {"1", "full", "app"}:
         return {"app": [], "plain": []}
     path = Path(__file__).resolve().parent.parent / "config" / "calibration-extended.json"
     if not path.exists():
-        raise FileNotFoundError(f"OW_CALIB_EXTENDED=1 but {path} is missing")
+        raise FileNotFoundError(f"OW_CALIB_EXTENDED={mode} but {path} is missing")
     data = json.loads(path.read_text(encoding="utf-8"))
-    return {"app": list(data.get("app") or []), "plain": list(data.get("plain") or [])}
+    extra = {"app": list(data.get("app") or []), "plain": list(data.get("plain") or [])}
+    # "app" adds only the app-shaped rows. The 120 plain rows are GSM8K-style word problems,
+    # and on Qwen3 -- a model that writes a <think> block before answering -- they turned a
+    # 3.6x row increase into a 6x token increase and moved weight mass toward arithmetic.
+    # Running "app" beside "full" separates corpus size from corpus composition, which the
+    # first experiment changed together and therefore could not tell apart.
+    if mode == "app":
+        extra["plain"] = []
+    return extra
 
 
 def app_turns() -> list[str]:
