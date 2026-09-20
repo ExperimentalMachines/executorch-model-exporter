@@ -94,6 +94,21 @@ def causal_mask_bytes(arch: Architecture, context: int) -> int:
     return arch.attending * context * context
 
 
+# How far the estimate below runs under what the runner actually uses. Measured against
+# `host.peak_in_use_bytes` in 24 published export reports: it under-predicts in 18 of them,
+# by a median of 1.13x and a worst case of 1.70x, and the worst cases are the widest
+# windows -- Qwen3-1.7B at 16k was estimated at 20.4 GiB and used 34.7, finishing with 34 MB
+# of memory to spare on a runner with 23.4 GiB of RAM and 24 GiB of swap.
+#
+# Without this factor the estimate for that model at 32k is 44.9 GiB against a 46.5 GiB
+# budget, so the window was attempted and the runner was killed mid-export -- twice, in runs
+# 35413952925 and 35420508341, each time reported only as "the runner has received a
+# shutdown signal". With it, that window is refused as too wide and recorded as a skip,
+# while every window that has ever succeeded still fits: the widest of those, LFM2.5-2.6B at
+# 32k, is estimated at 21.8 GiB and measured 36.5.
+HOST_PEAK_HEADROOM = 1.7
+
+
 def export_peak_bytes(arch: Architecture, context: int) -> int:
     weights = (arch.embedding_params + arch.linear_params) * FP32_BYTES
     return int(
@@ -125,7 +140,7 @@ def choose_context(
         resident = device_resident_bytes(arch, context, runtime_overhead)
         peak = export_peak_bytes(arch, context)
         fits_device = resident <= device_budget
-        fits_host = host_budget is None or peak <= host_budget
+        fits_host = host_budget is None or peak * HOST_PEAK_HEADROOM <= host_budget
         rows.append(
             {
                 "context": context,

@@ -1,3 +1,5 @@
+import math
+
 from conftest import TOTAL_PARAMS, hf_config, load_json
 
 from pipeline import families, sizing
@@ -92,7 +94,9 @@ def test_window_choice_respects_host_budget():
     qwen = arch("Qwen/Qwen3-0.6B")
     unconstrained = sizing.choose_context(qwen, TIERS, 10**12, OVERHEAD, None)
     assert unconstrained.context == 32768
-    peak_at_16k = sizing.export_peak_bytes(qwen, 16384)
+    # The budget has to cover the estimate plus the headroom the estimate is known to run
+    # under by, which is what choose_context compares against.
+    peak_at_16k = math.ceil(sizing.export_peak_bytes(qwen, 16384) * sizing.HOST_PEAK_HEADROOM)
     limited = sizing.choose_context(qwen, TIERS, 10**12, OVERHEAD, peak_at_16k)
     assert limited.context == 16384
 
@@ -102,3 +106,45 @@ def test_no_window_fits():
     assert choice.context is None
     assert "no window fits" in choice.reason
     assert [row["context"] for row in choice.table] == list(TIERS)
+
+
+# The Blacksmith 8vcpu ARM runner, as its own export reports record it: 23.4 GiB of RAM and
+# 24 GiB of swap, less the 1 GB reserve host_budget keeps.
+RUNNER_BUDGET = int(23.4 * 2**30) + int(24.0 * 2**30) - 1_000_000_000
+
+
+def allowed_windows(model_id):
+    choice = sizing.choose_context(arch(model_id), TIERS, BUDGET, OVERHEAD, RUNNER_BUDGET)
+    return sorted(row["context"] for row in choice.table if row["fits_host"])
+
+
+def test_a_window_that_killed_the_runner_twice_is_refused():
+    """Qwen3-1.7B at 32k was attempted and killed the runner in runs 35413952925 and
+    35420508341, reported only as "the runner has received a shutdown signal".
+
+    It attends on all 28 layers, so its per-layer causal masks grow with the window where a
+    hybrid's do not: the raw estimate is 44.9 GiB against a 46.5 GiB budget, which fit, and
+    the measured figure would have been far higher -- the same model at 16k was estimated at
+    20.4 GiB and used 34.7.
+    """
+    assert allowed_windows("Qwen/Qwen3-1.7B") == [2048, 4096, 8192, 16384]
+
+
+def test_the_widest_window_that_did_succeed_is_still_allowed():
+    """The headroom has to refuse the window that died without refusing one that worked.
+
+    Qwen3-1.7B at 16k is the tightest export that has finished on this runner: estimated
+    20.4 GiB, measured 34.7, with 34 MB of memory left at the low point. It is in the list
+    above, and 32k is not.
+    """
+    assert 16384 in allowed_windows("Qwen/Qwen3-1.7B")
+    # And the smaller model of the same family keeps exactly the windows it actually has:
+    # experimentalmachines/Qwen3-0.6B-ExecuTorch publishes four .pte files, 2k to 16k, and
+    # never had a 32k one. The headroom agrees with what the fleet really contains.
+    assert allowed_windows("Qwen/Qwen3-0.6B") == [2048, 4096, 8192, 16384]
+
+
+def test_the_headroom_is_the_worst_ratio_actually_measured():
+    # 24 published reports carry both the estimate and host.peak_in_use_bytes. The estimate
+    # runs under in 18 of them, by a median of 1.13x and a worst case of 1.70x.
+    assert sizing.HOST_PEAK_HEADROOM >= 1.7

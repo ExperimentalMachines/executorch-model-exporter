@@ -66,6 +66,18 @@ def _verify(args) -> int:
     return 0
 
 
+def _audit(args) -> int:
+    """Exit codes: 0 the published file still decides like its fp32 model, 2 it does not."""
+    from pipeline import audit as audit_module
+    from pipeline.exporting import ExportError
+
+    try:
+        return audit_module.main(args.model, Path(args.work), args.backend, args.context)
+    except ExportError as error:
+        print(f"audit failed: {error}", file=sys.stderr)
+        return 2
+
+
 def _solve(args) -> int:
     from pipeline import solve as solve_module
 
@@ -228,6 +240,13 @@ def main(argv: list[str] | None = None) -> int:
         help="gate.json from `solve`: the file must decide like the fp32 model before it publishes",
     )
     verify.set_defaults(func=_verify)
+
+    audit = commands.add_parser("audit", help="gate a file that is already published, without rebuilding it")
+    audit.add_argument("model", help="the SOURCE model id, e.g. Qwen/Qwen3-1.7B")
+    audit.add_argument("--backend", default="xnnpack")
+    audit.add_argument("--work", default="audit-work")
+    audit.add_argument("--context", type=int, default=None, help="which window (default: any, they read alike)")
+    audit.set_defaults(func=_audit)
 
     solve = commands.add_parser("solve", help="GPTQ the int4 codes once per model, for every window to reuse")
     solve.add_argument("model")
