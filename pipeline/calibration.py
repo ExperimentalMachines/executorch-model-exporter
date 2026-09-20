@@ -42,6 +42,8 @@ and replies, which are the positions the decision actually lives in. ``sequences
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 # Kept short on purpose: every prompt costs an fp32 generation pass on the runner, and the
@@ -277,16 +279,37 @@ def app_head(tokenizer) -> str:
     return render_app(tokenizer, marker).split(marker)[0]
 
 
+def extended() -> dict[str, list[str]]:
+    """The experiment's extra rows, or nothing.
+
+    vLLM's LLM Compressor -- the reference implementation for production GPTQ -- calls for
+    128 to 512 calibration sequences and says to start at 128; this file ships 104, which is
+    under that floor. `config/calibration-extended.json` holds 273 further questions lifted
+    from the lab corpus that the hand-built exports used, with every question that appears in
+    the graded decision set removed (3 of them) and duplicates of this file's own questions
+    removed (1). Set ``OW_CALIB_EXTENDED=1`` to include them, which is how the experiment is
+    run; unset, this file behaves exactly as before and the published recipe does not move.
+    """
+    if os.environ.get("OW_CALIB_EXTENDED") != "1":
+        return {"app": [], "plain": []}
+    path = Path(__file__).resolve().parent.parent / "config" / "calibration-extended.json"
+    if not path.exists():
+        raise FileNotFoundError(f"OW_CALIB_EXTENDED=1 but {path} is missing")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return {"app": list(data.get("app") or []), "plain": list(data.get("plain") or [])}
+
+
 def app_turns() -> list[str]:
     """The user turn of every app-shaped row, trailer included where there is one."""
-    return [f"{q}\n\n{TRAILER.format(subject=s)}" for q, s in SEARCH_ROWS] + list(KNOWN_ROWS)
+    turns = [f"{q}\n\n{TRAILER.format(subject=s)}" for q, s in SEARCH_ROWS] + list(KNOWN_ROWS)
+    return turns + extended()["app"]
 
 
 def build(tokenizer) -> list[tuple[str, int]]:
     """Every calibration row as (prompt text, characters of shared head), app rows first."""
     head = app_head(tokenizer)
     rows = [(render_app(tokenizer, turn), len(head)) for turn in app_turns()]
-    rows += [(render(tokenizer, prompt), 0) for prompt in PROMPTS]
+    rows += [(render(tokenizer, prompt), 0) for prompt in list(PROMPTS) + extended()["plain"]]
     return rows
 
 

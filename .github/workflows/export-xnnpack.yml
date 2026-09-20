@@ -83,6 +83,10 @@ jobs:
       HF_HUB_DISABLE_PROGRESS_BARS: "1"
       MODEL_ID: ${{ inputs.model_id }}
       REVISION: ${{ inputs.revision }}
+      # EXPERIMENT BRANCH ONLY. Calibrate on 377 rows instead of the shipped 104, to test
+      # whether being under LLM Compressor's 128-sequence floor is costing recall. Do not
+      # merge this line: main must keep the published recipe.
+      OW_CALIB_EXTENDED: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
