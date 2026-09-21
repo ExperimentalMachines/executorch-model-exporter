@@ -4,7 +4,10 @@
 hub:
   # Where exports are published. One repo per source model: <org>/<source name><suffix>.
   org: experimentalmachines
-  repo_suffix: -ExecuTorch
+  # The app-shaped 257-row GPTQ calibration is a separately benchmarked recipe.
+  # Keep its artifacts and provenance in their own repository; never replace the
+  # generic 104-row exports.
+  repo_suffix: -GPTQ-257-ExecuTorch
   # Tags on every published repo. The app's Discover screen searches filter=executorch.
   tags: [executorch, android, on-device, openweights]
 
