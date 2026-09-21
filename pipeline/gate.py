@@ -203,3 +203,29 @@ def check(ref: dict, measured: dict) -> dict:
             for q in group
         },
     }
+
+
+def measuring_gate(stats: dict | None = None) -> dict:
+    """A non-blocking gate measuring prefill and decode throughput without failing push."""
+    if not stats:
+        return {
+            "kind": "measuring_gate",
+            "passed": True,
+            "prefill_tok_per_sec": None,
+            "decode_tok_per_sec": None,
+            "prompt_tokens": None,
+            "generated_tokens": None,
+        }
+    prefill = stats.get("prefill_token_per_sec")
+    decode = stats.get("decode_token_per_sec")
+    prompt_tok = stats.get("prompt_tokens") or stats.get("num_prompt_tokens")
+    gen_tok = stats.get("generated_tokens") or stats.get("num_generated_tokens")
+    return {
+        "kind": "measuring_gate",
+        "passed": True,
+        "prefill_tok_per_sec": round(float(prefill), 2) if prefill is not None else None,
+        "decode_tok_per_sec": round(float(decode), 2) if decode is not None else None,
+        "prompt_tokens": int(prompt_tok) if prompt_tok is not None else None,
+        "generated_tokens": int(gen_tok) if gen_tok is not None else None,
+    }
+

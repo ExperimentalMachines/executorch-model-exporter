@@ -97,3 +97,25 @@ def test_a_model_that_does_call_is_marked_as_measured():
     verdict = gate.check(reference(), measured(0.80, len(gate.SEARCH)))
     assert verdict["passed"]
     assert verdict["measures_tool_calling"] is True
+
+
+def test_measuring_gate_records_throughput_and_passes():
+    empty_result = gate.measuring_gate(None)
+    assert empty_result["kind"] == "measuring_gate"
+    assert empty_result["passed"] is True
+    assert empty_result["prefill_tok_per_sec"] is None
+
+    stats = {
+        "prefill_token_per_sec": 128.456,
+        "decode_token_per_sec": 42.123,
+        "prompt_tokens": 16,
+        "generated_tokens": 32,
+    }
+    result = gate.measuring_gate(stats)
+    assert result["kind"] == "measuring_gate"
+    assert result["passed"] is True
+    assert result["prefill_tok_per_sec"] == 128.46
+    assert result["decode_tok_per_sec"] == 42.12
+    assert result["prompt_tokens"] == 16
+    assert result["generated_tokens"] == 32
+

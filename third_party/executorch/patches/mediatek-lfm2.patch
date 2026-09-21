@@ -1,0 +1,1124 @@
+diff --git a/examples/mediatek/aot_utils/llm_utils/sanity_checks.py b/examples/mediatek/aot_utils/llm_utils/sanity_checks.py
+index 84b2e3a..84219ca 100644
+--- a/examples/mediatek/aot_utils/llm_utils/sanity_checks.py
++++ b/examples/mediatek/aot_utils/llm_utils/sanity_checks.py
+@@ -141,6 +141,7 @@ def check_supported_model(config):
+         "gemma2",
+         "gemma3",
+         "whisper",
++        "lfm2",
+     ]
+     if not isinstance(config, BaseConfig):
+         raise RuntimeError(
+diff --git a/examples/mediatek/aot_utils/llm_utils/utils.py b/examples/mediatek/aot_utils/llm_utils/utils.py
+index 6c00bbb..7d646ef 100644
+--- a/examples/mediatek/aot_utils/llm_utils/utils.py
++++ b/examples/mediatek/aot_utils/llm_utils/utils.py
+@@ -854,6 +854,11 @@ def resolve_model_classes(
+                 GemmaConfig as config_class,
+             )
+             from models.llm_models.modeling_gemma import Gemma3ModelChunk as chunk_class
++        elif config_file["model_type"] == "lfm2":
++            from models.llm_models.configuration_lfm2 import (
++                Lfm2Config as config_class,
++            )
++            from models.llm_models.modeling_lfm2 import Lfm2ModelChunk as chunk_class
+     else:
+         if config_file["llm"]["model_type"] == "whisper_decoder":
+             from models.llm_models.configuration_whisper import (
+@@ -887,6 +892,8 @@ def resolve_model_classes(
+                     from aot_utils.llm_utils.tokenizers_.tokenization_gpt2 import (
+                         GPT2Tokenizer as tokenizer_class,
+                     )
++                elif config_file["model_type"] == "lfm2":
++                    from transformers import AutoTokenizer as tokenizer_class
+             else:
+                 if config_file["llm"]["model_type"] == "whisper_decoder":
+                     from aot_utils.llm_utils.tokenizers_.tokenization_whisper import (
+diff --git a/examples/mediatek/model_export_scripts/lfm2.py b/examples/mediatek/model_export_scripts/lfm2.py
+new file mode 100644
+index 0000000..2b5a636
+--- /dev/null
++++ b/examples/mediatek/model_export_scripts/lfm2.py
+@@ -0,0 +1,518 @@
++# Copyright (c) MediaTek Inc.
++# All rights reserved
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++import os
++import sys
++
++if os.getcwd() not in sys.path:
++    sys.path.append(os.getcwd())
++import argparse
++import struct
++import warnings
++
++import torch
++
++from aot_utils.llm_utils.preformatter import Preformatter
++from aot_utils.llm_utils.sanity_checks import (
++    check_all_chunks_same_num_layer,
++    check_between_inclusive,
++    check_exist,
++    check_ext,
++    check_old_arg,
++    check_shapes,
++    check_supported_model,
++    check_supported_tokenizer,
++    check_tokenizer_exist,
++    check_weights_exist,
++)
++from aot_utils.llm_utils.utils import (
++    dump_embedding_lut_for_cmdline,
++    generate_mask,
++    get_dest_path,
++    get_dirname,
++    get_embedding_layer,
++    get_exp_name,
++    get_export_shapes,
++    get_master_rot_emb,
++    get_normalized_config,
++    load_checkpoints,
++    resolve_model_classes,
++)
++from datasets import load_dataset
++from executorch import exir
++from executorch.backends.mediatek import (
++    NeuropilotPartitioner,
++    NeuropilotQuantizer,
++    Precision,
++)
++from executorch.exir.backend.backend_api import (
++    MethodProgramsPartitionerSpec,
++    to_backend,
++)
++from executorch.exir.backend.backend_details import CompileSpec
++from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
++from tqdm import tqdm
++
++warnings.filterwarnings("ignore")
++
++
++def get_argument_parser():
++    parser = argparse.ArgumentParser(
++        description="Run Export to ET for suppoorted LLM models.", allow_abbrev=False
++    )
++    parser.add_argument(
++        "config",
++        type=str,
++        help="[Required] Model config json file. "
++        "Model config must be in same directory as all model weight bins and tokenizer files.",
++    )
++    parser.add_argument(
++        "-p",
++        "--precision",
++        type=str,
++        default="A16W8",
++        choices=["A16W4", "A16W8", "A16W16", "A8W4", "A8W8"],
++        help="Precision to quantize entire model to.",
++    )
++    parser.add_argument(
++        "--platform",
++        type=str,
++        default="DX4",
++        choices=["DX3", "DX4"],
++        help="Chip model of the inference device. "
++        "DX3 for Dimensity 9300, DX4 for Dimensity 9400.",
++    )
++    parser.add_argument(
++        "-d",
++        "--dataset",
++        type=str,
++        default=None,
++        help="Calibration dataset name or path to dataset. Defaults to None to use random inputs",
++    )
++    parser.add_argument(
++        "-n",
++        "--num_chunks",
++        type=int,
++        default=4,
++        help="Number of chunks to cut the model into. Defaults to 4.",
++    )
++    parser.add_argument(
++        "-r",
++        "--response_cap",
++        type=int,
++        default=9,
++        help="Max Number of Response Tokens to save during calibration. Defaults to 9.",
++    )
++    parser.add_argument(
++        "--preformatter",
++        type=str,
++        default=None,
++        help="Preformatter Template to use to wrap input with. Defaults to None.",
++    )
++    parser.add_argument(
++        "-shapes",
++        nargs="+",
++        help="[Required] Expected input shapes to reconfigure TFLites to. Space separated list of "
++        "shapes in the format: xtyc (e.g. 32t512c)",
++    )
++
++    return parser
++
++
++# flake8: noqa: F405
++def args_sanity_checks(args):
++    check_old_arg(args.config)
++    check_exist(args.config, "Config file")
++    check_ext(args.config, ".json", "Config file")
++    config = get_normalized_config(args.config)
++
++    weight_dir = get_dirname(args.config)
++    check_tokenizer_exist(weight_dir)
++    check_weights_exist(weight_dir)
++
++    check_supported_model(config)
++    check_supported_tokenizer(config)
++
++    if args.preformatter is not None:
++        check_exist(args.preformatter, "Preformatter json file")
++        check_ext(args.preformatter, ".json", "preformatter")
++
++    if args.dataset is not None:
++        check_exist(args.dataset)
++
++    check_between_inclusive(args.num_chunks, 1, config.num_hidden_layers, "num_chunks")
++
++    check_shapes(args.shapes)
++
++
++def print_args(args, exp_name):
++    print("Please check if all arguments are correct:")
++    print(f"Config file:                  {args.config}")
++    print(f"Output pte folder:            pte/{exp_name}")
++    print(f"Quantization precision:       {args.precision}")
++    print(f"Preformatter:                 {args.preformatter}")
++    print(f"Calibration Dataset:          {args.dataset}")
++    print(f"Max Response Tokens:          {args.response_cap}")
++    print(f"Number of chunks:             {args.num_chunks}")
++    print(f"Export shape(s):              {args.shapes}")
++    print(f"Platform:                     {args.platform}")
++    print()
++
++
++def apply_preformatter(inp, preformatter=None):
++    formatted_text = preformatter.generate_prompt(inp["text"])
++    inp["text"] = formatted_text
++    print(f"Formatted Prompt:\n{formatted_text}")
++    return inp
++
++
++def tokenize_dataset(inp, tokenizer):
++    text = inp["text"]
++    inp_encoded = tokenizer(text, return_tensors="pt")
++    inp_encoded.pop("attention_mask", None)
++    inp_encoded = inp_encoded["input_ids"]
++    inp_encoded = inp_encoded.to(torch.int32)
++    inp["input_ids"] = inp_encoded
++    inp.pop("text", None)
++    return inp
++
++
++def reset_cache(
++    num_chunks, num_key_value_heads, num_blocks_per_chunk, head_dim, max_cache_size
++):
++    cache = []
++    for i in range(num_chunks):
++        curr_chunk_cache = torch.zeros(
++            (
++                2 * num_blocks_per_chunk[i],
++                num_key_value_heads,
++                max_cache_size,
++                head_dim,
++            ),
++            dtype=torch.float32,
++        )
++        cache.append(curr_chunk_cache)
++    return cache
++
++
++def forward_and_save(
++    models,
++    hidden_state,
++    cache,
++    mask,
++    pos_emb,
++    model_input_dict,
++    num_blocks_per_chunk,
++    batch_name,
++):
++    for chunk_idx in range(len(models)):
++        cache_in = cache[chunk_idx]
++
++        try:
++            model_input_dict[str(chunk_idx)] = {
++                **model_input_dict[str(chunk_idx)],
++                batch_name: {
++                    "hidden_state": hidden_state,
++                    "mask": mask,
++                    "pos_emb": pos_emb,
++                    "cache": cache_in,
++                },
++            }
++        except Exception:
++            model_input_dict[str(chunk_idx)] = {
++                batch_name: {
++                    "hidden_state": hidden_state,
++                    "mask": mask,
++                    "pos_emb": pos_emb,
++                    "cache": cache_in,
++                }
++            }
++        with torch.no_grad():
++            model_out = models[chunk_idx](
++                hidden_state, mask, pos_emb, *torch.split(cache_in, 1, dim=0)
++            )
++        hidden_state = model_out[0]
++        cache[chunk_idx] = torch.cat(
++            model_out[1 : 1 + 2 * num_blocks_per_chunk[chunk_idx]], dim=0
++        ).clone()
++    return hidden_state, cache
++
++
++def prepare_model_inputs(
++    inp,
++    models,
++    embedding_layer,
++    master_rot_emb,
++    num_blocks_per_chunk,
++    num_key_value_heads,
++    head_dim,
++    max_cache_size,
++    eos_token_id_tensor,
++    response_cap,
++):
++    model_input_dict = {str(i): None for i in range(len(models))}
++    input_ids = inp.pop("input_ids")
++    hidden_state = embedding_layer(torch.tensor(input_ids))
++    input_length = hidden_state.shape[1]
++    mask = generate_mask(max_cache_size, 0, input_length, input_length)
++    pos_emb = master_rot_emb[:, :, :input_length, :]
++    cache = reset_cache(
++        len(models), num_key_value_heads, num_blocks_per_chunk, head_dim, max_cache_size
++    )
++    logits, cache = forward_and_save(
++        models,
++        hidden_state,
++        cache,
++        mask,
++        pos_emb,
++        model_input_dict,
++        num_blocks_per_chunk,
++        "prompt",
++    )
++    next_token_logits = logits[:, -1, :]
++    next_token = torch.argmax(next_token_logits, dim=-1)
++    response_count = 0
++    seq_length = input_length
++    while True:
++        curr_input_id = next_token[:, None].to(torch.int32)
++        input_length = curr_input_id.shape[1]
++        hidden_state = embedding_layer(curr_input_id)
++        mask = generate_mask(max_cache_size, seq_length, input_length, input_length)
++        pos_emb = master_rot_emb[:, :, seq_length : seq_length + input_length, :]
++        logits, cache = forward_and_save(
++            models,
++            hidden_state,
++            cache,
++            mask,
++            pos_emb,
++            model_input_dict,
++            num_blocks_per_chunk,
++            f"response{response_count}",
++        )
++        next_token_logits = logits[:, -1, :]
++        next_token = torch.argmax(next_token_logits, dim=-1)
++
++        if next_token == eos_token_id_tensor:
++            print(f"Found EOS on batch: {response_count}")
++            break
++
++        response_count += 1
++        seq_length += input_length
++        if response_count == response_cap:
++            break
++
++    return model_input_dict
++
++
++def calibrate_model(model, cal_dataset, chunk_idx: str):
++    with torch.no_grad():
++        for inp in tqdm(cal_dataset, desc="Calibrating Model: "):
++            for batch in tqdm(inp[chunk_idx].keys(), desc="Batch: "):
++                if inp[chunk_idx][batch] is not None:
++                    inputs_embeds = torch.tensor(inp[chunk_idx][batch]["hidden_state"])
++                    mask = torch.tensor(inp[chunk_idx][batch]["mask"])
++                    pos_emb = torch.tensor(inp[chunk_idx][batch]["pos_emb"])
++                    cache = torch.tensor(inp[chunk_idx][batch]["cache"])
++                    model(inputs_embeds, mask, pos_emb, *torch.split(cache, 1, dim=0))
++
++
++def export_to_et_ir(
++    output_folder,
++    exp_name,
++    model,
++    precision,
++    max_num_token,
++    max_cache_size,
++    chunk_idx,
++    export_shapes,
++    platform_b,
++    cal_dataset=None,
++):
++    print(f"Exporting Chunk {chunk_idx} to PTE")
++    example_inputs, dynamic_shapes = model.get_example_inputs(
++        max_num_token, max_cache_size, True
++    )
++    print("Getting pre autograd ATen Dialect Graph")
++    pre_autograd_aten_dialect = torch.export.export(
++        model, example_inputs, dynamic_shapes=dynamic_shapes, strict=True
++    ).module()
++    quantizer = NeuropilotQuantizer()
++    quantizer.setup_precision(getattr(Precision, precision))
++    prepared_graph = prepare_pt2e(pre_autograd_aten_dialect, quantizer)
++    if cal_dataset is not None:
++        calibrate_model(prepared_graph, cal_dataset, str(chunk_idx))
++    else:
++        prepared_graph(*example_inputs)
++    converted_graph = convert_pt2e(prepared_graph, fold_quantize=False)
++
++    method_to_edge_program = {}
++    method_to_partitioner = {}
++    edge_compile_config = exir.EdgeCompileConfig(_check_ir_validity=False)
++
++    model_shared_key_name = f"{exp_name}_{chunk_idx}"
++
++    for shape, ntok_and_cache in export_shapes.items():
++        model_fname = f"{exp_name}_{shape}_{chunk_idx}"
++        example_inputs = model.get_example_inputs(*ntok_and_cache)
++        print(f"Getting ATen Dialect Graph for {exp_name} {shape} chunk {chunk_idx}")
++        aten_dialect: exir.ExportedProgram = torch.export.export(
++            converted_graph, example_inputs, strict=True
++        )
++
++        method_to_edge_program[f"{model_fname}"] = exir.to_edge(
++            aten_dialect
++        ).exported_program()
++        del aten_dialect
++
++        compile_spec = [
++            CompileSpec("gno", b"LTS"),
++            CompileSpec("gno-exp", b""),
++            CompileSpec("gno-non-4d-tiling", b""),
++            CompileSpec("ImportForever", struct.pack("?", True)),
++            CompileSpec("platform-config", platform_b),
++            CompileSpec("ExtractSharedBlobKey", model_shared_key_name.encode()),
++        ]
++        method_to_partitioner[f"{model_fname}"] = NeuropilotPartitioner(compile_spec)
++
++    print("Delegating Edge Program to Neuropilot Backend")
++    delegated_program = to_backend(
++        MethodProgramsPartitionerSpec(method_to_edge_program, method_to_partitioner)
++    )
++
++    edge_manager = exir.EdgeProgramManager(
++        delegated_program, compile_config=edge_compile_config
++    )
++    del delegated_program
++
++    print("Transforming delegated program to executorch backend")
++    executorch_program = edge_manager.to_executorch(
++        config=exir.ExecutorchBackendConfig(
++            memory_planning_pass=exir.passes.MemoryPlanningPass(
++                alloc_graph_input=False,
++                alloc_graph_output=False,
++            ),
++            extract_delegate_segments=True,
++        )
++    )
++    del edge_manager
++    print(f"\n Model Size: {len(executorch_program.buffer)}")
++
++    dest_path = get_dest_path(output_folder, exp_name, None, chunk_idx)
++    print(f"{exp_name} ET Model chunk {chunk_idx} Dest: {dest_path}\n")
++    os.makedirs(dest_path.rsplit("/", 1)[0], exist_ok=True)
++    with open(dest_path, "wb") as file:
++        file.write(executorch_program.buffer)
++
++
++def main():
++    parser = get_argument_parser()
++    args = parser.parse_args()
++    args_sanity_checks(args)
++    if args.dataset is None:
++        exp_name = f"{get_exp_name(args.config)}_{args.precision}_dummy_cal_{args.num_chunks}_chunks"
++    else:
++        exp_name = (
++            f"{get_exp_name(args.config)}_{args.precision}_{args.num_chunks}_chunks"
++        )
++    if args.platform == "DX4":
++        platform_b = b"mt6991"
++    elif args.platform == "DX3":
++        platform_b = b"mt6989"
++    else:
++        raise ValueError(
++            f"Platform should be either DX3 or DX4, but got {args.platform}"
++        )
++    print_args(args, exp_name)
++
++    config, weight_dir, tokenizer_class, chunk_class = resolve_model_classes(
++        args.config
++    )
++    tokenizer = tokenizer_class.from_pretrained(weight_dir)
++    if args.preformatter is not None:
++        preformatter = Preformatter(args.preformatter)
++
++    head_dim = int(config.head_dim)
++
++    num_blocks_per_chunk = [
++        (config.num_hidden_layers // args.num_chunks)
++        + (i < (config.num_hidden_layers % args.num_chunks))
++        for i in range(args.num_chunks)
++    ]
++    check_all_chunks_same_num_layer(num_blocks_per_chunk)
++
++    output_folder = os.path.join("pte", exp_name)
++
++    state_dict = load_checkpoints(weight_dir)
++
++    dump_embedding_lut_for_cmdline(weight_dir, state_dict, config)
++
++    export_shapes, max_num_token, max_cache_size = get_export_shapes(args.shapes)
++    print(f"export shapes: {export_shapes}")
++    print(f"Max Num Token: {max_num_token}")
++    print(f"Max Cache Size: {max_cache_size}")
++
++    if args.dataset is not None:
++        embedding_layer = get_embedding_layer(config, weight_dir, state_dict)
++
++    print("Instantiating submodels")
++    models = []
++    for chunk_idx, num_blocks in enumerate(num_blocks_per_chunk):
++        chunk = chunk_class(
++            config,
++            num_blocks,
++            chunk_idx=chunk_idx,
++            dtype=torch.float32,
++            include_tail=(chunk_idx == args.num_chunks - 1),
++            jit_trace=True,
++        )
++        chunk = chunk.load_weights(state_dict, sum(num_blocks_per_chunk[:chunk_idx]))
++        models.append(chunk)
++
++    cal_dataset = None
++    if args.dataset is not None:
++        cal_dataset = load_dataset("text", data_files=args.dataset, split="train")
++        master_rot_emb = get_master_rot_emb(config, dtype=torch.float32)
++        if args.preformatter is not None:
++            cal_dataset = cal_dataset.map(
++                apply_preformatter, fn_kwargs={"preformatter": preformatter}
++            )
++        cal_dataset = cal_dataset.map(
++            tokenize_dataset, fn_kwargs={"tokenizer": tokenizer}
++        )
++        print("Preparing Model Calibration Inputs...")
++        cal_dataset = cal_dataset.map(
++            prepare_model_inputs,
++            fn_kwargs={
++                "models": models,
++                "embedding_layer": embedding_layer,
++                "master_rot_emb": master_rot_emb,
++                "num_blocks_per_chunk": num_blocks_per_chunk,
++                "num_key_value_heads": config.num_key_value_heads,
++                "head_dim": head_dim,
++                "max_cache_size": max_cache_size,
++                "eos_token_id_tensor": torch.tensor(tokenizer.eos_token_id),
++                "response_cap": args.response_cap,
++            },
++        )
++        cal_dataset = cal_dataset.with_format("numpy")
++
++    for chunk_idx, chunk in enumerate(models):
++        export_to_et_ir(
++            output_folder,
++            exp_name,
++            chunk,
++            args.precision,
++            max_num_token,
++            max_cache_size,
++            chunk_idx,
++            export_shapes,
++            platform_b,
++            cal_dataset,
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/mediatek/models/llm_models/configuration_lfm2.py b/examples/mediatek/models/llm_models/configuration_lfm2.py
+new file mode 100644
+index 0000000..7bec8ab
+--- /dev/null
++++ b/examples/mediatek/models/llm_models/configuration_lfm2.py
+@@ -0,0 +1,116 @@
++# Copyright (c) MediaTek Inc.
++# All rights reserved
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++from contextlib import nullcontext
++
++from models.llm_models.configuration_base import BaseConfig
++
++
++class Lfm2Config(BaseConfig):
++    def __init__(
++        self,
++        vocab_size=None,
++        hidden_size=None,
++        intermediate_size=None,
++        num_hidden_layers=None,
++        num_attention_heads=None,
++        max_position_embeddings=None,
++        norm="RMSNorm",
++        position_embedding="rope",
++        norm_eps=1e-5,
++        pad_token_id=0,
++        bos_token_id=1,
++        eos_token_id=7,
++        unk_token_id=0,
++        use_stable_embedding=False,
++        tie_word_embeddings=True,
++        combine_qkv=False,
++        response_handler=None,
++        model_type="lfm2",
++        **kwargs,
++    ):
++        super().__init__()
++
++        self.model_type = model_type
++        self.vocab_size = vocab_size
++        if self.vocab_size is None:
++            raise KeyError("vocab_size is required but missing from config.json")
++        self.hidden_size = hidden_size
++        if self.hidden_size is None:
++            raise KeyError("hidden_size is required but missing from config.json")
++        self.intermediate_size = intermediate_size
++        if self.intermediate_size is None:
++            raise KeyError("intermediate_size is required but missing from config.json")
++        self.num_hidden_layers = num_hidden_layers
++        if self.num_hidden_layers is None:
++            raise KeyError("num_hidden_layers is required but missing from config.json")
++        self.num_attention_heads = num_attention_heads
++        if self.num_attention_heads is None:
++            raise KeyError(
++                "num_attention_heads is required but missing from config.json"
++            )
++        self.num_key_value_heads = kwargs.pop(
++            "num_key_value_heads", 8
++        )
++        if self.num_attention_heads % self.num_key_value_heads != 0:
++            raise RuntimeError(
++                f"num_attention_heads ({self.num_attention_heads}) must be exactly "
++                f"divisible by num_key_value_heads ({self.num_key_value_heads})"
++            )
++        self.norm = norm
++        self.norm_eps = kwargs.pop("block_norm_eps", kwargs.pop("rms_norm_eps", norm_eps))
++        self.bos_token_id = bos_token_id
++        self.eos_token_id = eos_token_id
++        self.pad_token_id = pad_token_id
++        self.unk_token_id = unk_token_id
++        self.head_dim = kwargs.pop(
++            "head_dim", self.hidden_size // self.num_attention_heads
++        )
++
++        self.position_embedding = position_embedding
++        self.max_position_embeddings = max_position_embeddings or 131072
++
++        self.use_stable_embedding = use_stable_embedding
++        self.tie_word_embeddings = kwargs.pop("tie_embedding", tie_word_embeddings)
++        self.combine_qkv = combine_qkv
++
++        self.conv_dim = kwargs.pop("conv_dim", self.hidden_size)
++        self.conv_L_cache = kwargs.pop("conv_L_cache", 3)
++        self.layer_types = kwargs.pop("layer_types", None)
++        if self.layer_types is None:
++            raise KeyError("layer_types is required for lfm2")
++
++        self.use_qk_norm = True
++        self.tokenizer = kwargs.pop("tokenizer", "default")
++
++        if response_handler is None:
++            response_handler = nullcontext()
++        self.response_handler = response_handler
++
++        if kwargs.pop("verbose", True):
++            self.print_config(response_handler)
++
++    def print_config(self, response_handler):
++        with response_handler:
++            print(f"{self.model_type} config:")
++            print(f"Hidden size:          {self.hidden_size}")
++            print(f"Intermediate size:    {self.intermediate_size}")
++            print(f"Num layers:           {self.num_hidden_layers}")
++            print(f"Num attention heads:  {self.num_attention_heads}")
++            print(f"Num KV heads:         {self.num_key_value_heads}")
++            print(f"Head Dim:             {self.head_dim}")
++            print(f"Conv Dim:             {self.conv_dim}")
++            print(f"Conv L cache:         {self.conv_L_cache}")
++            print(f"Positional embedding: {self.position_embedding}")
++            print(f"Max pos emb:          {self.max_position_embeddings}")
++            print(f"Norm type:            {self.norm}")
++            print(f"Norm epsilon:         {self.norm_eps}")
++            print(f"BOS token id:         {self.bos_token_id}")
++            print(f"EOS token id:         {self.eos_token_id}")
++            print(f"PAD token id:         {self.pad_token_id}")
++            print(f"Vocab size:           {self.vocab_size}")
++            print(f"Tie word embeddings:  {self.tie_word_embeddings}")
++            print()
+diff --git a/examples/mediatek/models/llm_models/modeling_lfm2.py b/examples/mediatek/models/llm_models/modeling_lfm2.py
+new file mode 100644
+index 0000000..902f255
+--- /dev/null
++++ b/examples/mediatek/models/llm_models/modeling_lfm2.py
+@@ -0,0 +1,435 @@
++# Copyright (c) MediaTek Inc.
++# All rights reserved
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++
++import numpy as np
++import torch
++from models.llm_models.configuration_lfm2 import Lfm2Config
++from models.llm_models.modeling_base import BaseModelChunk
++from models.llm_models.modeling_common import Attention, MLP, RMSNorm
++from torch import nn
++from torch.export import Dim
++
++np.random.seed(42)
++torch.manual_seed(42)
++
++
++class Lfm2AttentionLayer(nn.Module):
++    def __init__(self, config: Lfm2Config, jit_trace=False):
++        super().__init__()
++        self.config = config
++        self.jit_trace = jit_trace
++        self.input_norm = RMSNorm(config.hidden_size, eps=config.norm_eps).float()
++        self.self_attn = Attention(config, jit_trace=jit_trace)
++        self.post_attention_norm = RMSNorm(config.hidden_size, eps=config.norm_eps).float()
++        self.mlp = MLP(config)
++
++    def forward(self, hidden_states, mask, pos_emb, past_key, past_value):
++        residual = hidden_states
++        if self.jit_trace:
++            normed = self.input_norm(hidden_states)
++        else:
++            dtype = hidden_states.dtype
++            normed = self.input_norm(hidden_states.to(torch.float32)).to(dtype)
++
++        attn_out, present_key, present_value = self.self_attn(
++            hidden_states=normed,
++            mask=mask,
++            pos_emb=pos_emb,
++            past_key=past_key,
++            past_value=past_value,
++        )
++        hidden_states = residual + attn_out
++
++        residual = hidden_states
++        if self.jit_trace:
++            normed = self.post_attention_norm(hidden_states)
++        else:
++            dtype = hidden_states.dtype
++            normed = self.post_attention_norm(hidden_states.to(torch.float32)).to(dtype)
++        mlp_out = self.mlp(normed)
++        hidden_states = residual + mlp_out
++
++        return hidden_states, present_key, present_value
++
++
++class Lfm2ShortConvLayer(nn.Module):
++    def __init__(self, config: Lfm2Config, jit_trace=False):
++        super().__init__()
++        self.config = config
++        self.jit_trace = jit_trace
++        self.dim = config.hidden_size
++        self.num_kv_heads = config.num_key_value_heads
++        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
++        self.L_cache = config.conv_L_cache
++
++        self.input_norm = RMSNorm(config.hidden_size, eps=config.norm_eps).float()
++        self.B_proj = nn.Linear(self.dim, self.dim, bias=False)
++        self.C_proj = nn.Linear(self.dim, self.dim, bias=False)
++        self.x_proj = nn.Linear(self.dim, self.dim, bias=False)
++        self.conv = nn.Conv1d(
++            self.dim,
++            self.dim,
++            kernel_size=self.L_cache,
++            padding=0,
++            groups=self.dim,
++            bias=False,
++        )
++        self.out_proj = nn.Linear(self.dim, self.dim, bias=False)
++        self.post_attention_norm = RMSNorm(config.hidden_size, eps=config.norm_eps).float()
++        self.mlp = MLP(config)
++
++    def forward(self, hidden_states, mask, pos_emb, past_key, past_value):
++        residual = hidden_states
++        if self.jit_trace:
++            normed = self.input_norm(hidden_states)
++        else:
++            dtype = hidden_states.dtype
++            normed = self.input_norm(hidden_states.to(torch.float32)).to(dtype)
++
++        q_len = normed.shape[1]
++        B = self.B_proj(normed).transpose(-1, -2)
++        C = self.C_proj(normed).transpose(-1, -2)
++        X = self.x_proj(normed).transpose(-1, -2)
++        Bx = B * X
++
++        # conv_state is carried in past_key's first 8 rows
++        # shape: (1, num_kv_heads, 8, head_dim) -> (1, 8*8*64) -> (1, dim, L_cache - 1)
++        state = past_key[:, :, :8, :].reshape(1, self.dim, self.L_cache - 1)
++        Bx_padded = torch.cat([state, Bx], dim=-1)
++        new_state = Bx_padded[:, :, -(self.L_cache - 1):]
++        conv_out = self.conv(Bx_padded)[:, :, :q_len]
++        y = (C * conv_out).transpose(-1, -2).contiguous()
++        conv_out = self.out_proj(y)
++        hidden_states = residual + conv_out
++
++        residual = hidden_states
++        if self.jit_trace:
++            normed = self.post_attention_norm(hidden_states)
++        else:
++            dtype = hidden_states.dtype
++            normed = self.post_attention_norm(hidden_states.to(torch.float32)).to(dtype)
++        mlp_out = self.mlp(normed)
++        hidden_states = residual + mlp_out
++
++        next_key = torch.cat(
++            [new_state.reshape(1, self.num_kv_heads, 8, self.head_dim), past_key[:, :, 8:, :]],
++            dim=2,
++        )
++        next_value = past_value
++        return hidden_states, next_key, next_value
++
++
++class Lfm2ModelChunk(BaseModelChunk):
++    def __init__(
++        self,
++        config: Lfm2Config,
++        num_blocks,
++        chunk_idx,
++        dtype=torch.float32,
++        include_tail=False,
++        return_attn=False,
++        jit_trace=False,
++    ):
++        super().__init__(
++            config, num_blocks, chunk_idx, dtype, include_tail, return_attn, jit_trace
++        )
++        self.head_dim = getattr(
++            self.config, "head_dim", config.hidden_size // config.num_attention_heads
++        )
++
++        start_layer_idx = chunk_idx * num_blocks
++        self.layers = nn.ModuleList()
++        for i in range(num_blocks):
++            global_idx = start_layer_idx + i
++            layer_type = self.config.layer_types[global_idx]
++            if layer_type == "conv":
++                self.layers.append(Lfm2ShortConvLayer(config, jit_trace=jit_trace))
++            else:
++                self.layers.append(Lfm2AttentionLayer(config, jit_trace=jit_trace))
++
++        if self.include_tail:
++            self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps).float()
++            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
++
++    def forward(self, inputs_embeds, mask, pos_emb, *cache):
++        if not self.jit_trace:
++            assert (
++                len(cache) == 2 * self.num_blocks
++            ), f"split cache wrong number of input caches: {len(cache)} != 2*{self.num_blocks}"
++            assert (
++                cache[0].shape[0] == inputs_embeds.size()[0]
++            ), f"split cache batch size mismatch: {cache[0].shape[0]} != {inputs_embeds.size()[0]}"
++
++        hidden_states = inputs_embeds
++        next_key_cache = []
++        next_value_cache = []
++
++        for idx, layer in enumerate(self.layers):
++            layer_device = self.device_list[idx] if self.device_list else hidden_states.device
++            hidden_states, next_k, next_v = layer(
++                hidden_states.to(layer_device),
++                mask=mask.to(layer_device),
++                pos_emb=pos_emb.to(layer_device),
++                past_key=cache[idx].to(layer_device),
++                past_value=cache[self.num_blocks + idx].to(layer_device),
++            )
++            next_key_cache.append(next_k.to(inputs_embeds.device))
++            next_value_cache.append(next_v.to(inputs_embeds.device))
++
++        if self.include_tail:
++            tail_device = self.device_list[-1] if self.device_list else hidden_states.device
++            if self.jit_trace:
++                hidden_states = self.norm(hidden_states.to(tail_device))
++            else:
++                hidden_states = self.norm(hidden_states.to(tail_device).to(torch.float32)).to(self.dtype)
++            hidden_states = self.lm_head(hidden_states)
++
++        return hidden_states, *next_key_cache, *next_value_cache
++
++    def load_weights(self, state_dict, state_dict_start_idx):
++        fake_weights = state_dict is None
++
++        # Find key prefix (e.g. "model." or "")
++        prefix = ""
++        if not fake_weights:
++            for k in state_dict.keys():
++                if "layers." in k:
++                    prefix = k.split("layers.")[0]
++                    break
++
++        temp_state_dict = {}
++        outer_layer_idx = state_dict_start_idx
++        self.device_list = []
++
++        for inner_layer_idx in range(self.num_blocks):
++            layer_type = self.config.layer_types[outer_layer_idx]
++            if fake_weights:
++                temp_state_dict[f"layers.{inner_layer_idx}.input_norm.weight"] = torch.rand(
++                    self.config.hidden_size, dtype=torch.float32
++                )
++                temp_state_dict[f"layers.{inner_layer_idx}.post_attention_norm.weight"] = torch.rand(
++                    self.config.hidden_size, dtype=torch.float32
++                )
++                temp_state_dict[f"layers.{inner_layer_idx}.mlp.gate_proj.weight"] = torch.rand(
++                    self.config.intermediate_size, self.config.hidden_size, dtype=self.dtype
++                )
++                temp_state_dict[f"layers.{inner_layer_idx}.mlp.gate_proj.bias"] = torch.zeros(
++                    self.config.intermediate_size, dtype=self.dtype
++                )
++                temp_state_dict[f"layers.{inner_layer_idx}.mlp.up_proj.weight"] = torch.rand(
++                    self.config.intermediate_size, self.config.hidden_size, dtype=self.dtype
++                )
++                temp_state_dict[f"layers.{inner_layer_idx}.mlp.up_proj.bias"] = torch.zeros(
++                    self.config.intermediate_size, dtype=self.dtype
++                )
++                temp_state_dict[f"layers.{inner_layer_idx}.mlp.down_proj.weight"] = torch.rand(
++                    self.config.hidden_size, self.config.intermediate_size, dtype=self.dtype
++                )
++                temp_state_dict[f"layers.{inner_layer_idx}.mlp.down_proj.bias"] = torch.zeros(
++                    self.config.hidden_size, dtype=self.dtype
++                )
++                if layer_type == "conv":
++                    temp_state_dict[f"layers.{inner_layer_idx}.B_proj.weight"] = torch.rand(
++                        self.config.hidden_size, self.config.hidden_size, dtype=self.dtype
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.C_proj.weight"] = torch.rand(
++                        self.config.hidden_size, self.config.hidden_size, dtype=self.dtype
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.x_proj.weight"] = torch.rand(
++                        self.config.hidden_size, self.config.hidden_size, dtype=self.dtype
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.conv.weight"] = torch.rand(
++                        self.config.hidden_size, 1, self.config.conv_L_cache, dtype=self.dtype
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.out_proj.weight"] = torch.rand(
++                        self.config.hidden_size, self.config.hidden_size, dtype=self.dtype
++                    )
++                else:
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.q_proj.weight"] = torch.rand(
++                        self.config.hidden_size, self.config.hidden_size, dtype=self.dtype
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.q_proj.bias"] = torch.zeros(
++                        self.config.num_attention_heads * self.head_dim, dtype=self.dtype
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.k_proj.weight"] = torch.rand(
++                        self.config.num_key_value_heads * self.head_dim, self.config.hidden_size, dtype=self.dtype
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.k_proj.bias"] = torch.zeros(
++                        self.config.num_key_value_heads * self.head_dim, dtype=self.dtype
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.v_proj.weight"] = torch.rand(
++                        self.config.num_key_value_heads * self.head_dim, self.config.hidden_size, dtype=self.dtype
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.v_proj.bias"] = torch.zeros(
++                        self.config.num_key_value_heads * self.head_dim, dtype=self.dtype
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.o_proj.weight"] = torch.rand(
++                        self.config.hidden_size, self.config.hidden_size, dtype=self.dtype
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.o_proj.bias"] = torch.zeros(
++                        self.config.hidden_size, dtype=self.dtype
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.q_norm.weight"] = torch.rand(
++                        self.head_dim, dtype=torch.float32
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.k_norm.weight"] = torch.rand(
++                        self.head_dim, dtype=torch.float32
++                    )
++            else:
++                # Norms
++                input_norm_w = state_dict.pop(f"{prefix}layers.{outer_layer_idx}.operator_norm.weight")
++                temp_state_dict[f"layers.{inner_layer_idx}.input_norm.weight"] = input_norm_w.to(torch.float32)
++
++                post_norm_key = f"{prefix}layers.{outer_layer_idx}.ffn_norm.weight"
++                if post_norm_key not in state_dict:
++                    post_norm_key = f"{prefix}layers.{outer_layer_idx}.post_attention_layernorm.weight"
++                temp_state_dict[f"layers.{inner_layer_idx}.post_attention_norm.weight"] = state_dict.pop(
++                    post_norm_key
++                ).to(torch.float32)
++
++                # MLP (SwiGLU)
++                gate_key = f"{prefix}layers.{outer_layer_idx}.feed_forward.w1.weight"
++                if gate_key not in state_dict:
++                    gate_key = f"{prefix}layers.{outer_layer_idx}.mlp.gate_proj.weight"
++                down_key = f"{prefix}layers.{outer_layer_idx}.feed_forward.w2.weight"
++                if down_key not in state_dict:
++                    down_key = f"{prefix}layers.{outer_layer_idx}.mlp.down_proj.weight"
++                up_key = f"{prefix}layers.{outer_layer_idx}.feed_forward.w3.weight"
++                if up_key not in state_dict:
++                    up_key = f"{prefix}layers.{outer_layer_idx}.mlp.up_proj.weight"
++
++                temp_state_dict[f"layers.{inner_layer_idx}.mlp.gate_proj.weight"] = state_dict.pop(gate_key)
++                temp_state_dict[f"layers.{inner_layer_idx}.mlp.down_proj.weight"] = state_dict.pop(down_key)
++                temp_state_dict[f"layers.{inner_layer_idx}.mlp.up_proj.weight"] = state_dict.pop(up_key)
++
++                temp_state_dict[f"layers.{inner_layer_idx}.mlp.gate_proj.bias"] = state_dict.pop(
++                    f"{prefix}layers.{outer_layer_idx}.mlp.gate_proj.bias",
++                    torch.zeros(self.config.intermediate_size, dtype=self.dtype),
++                )
++                temp_state_dict[f"layers.{inner_layer_idx}.mlp.down_proj.bias"] = state_dict.pop(
++                    f"{prefix}layers.{outer_layer_idx}.mlp.down_proj.bias",
++                    torch.zeros(self.config.hidden_size, dtype=self.dtype),
++                )
++                temp_state_dict[f"layers.{inner_layer_idx}.mlp.up_proj.bias"] = state_dict.pop(
++                    f"{prefix}layers.{outer_layer_idx}.mlp.up_proj.bias",
++                    torch.zeros(self.config.intermediate_size, dtype=self.dtype),
++                )
++
++                if layer_type == "conv":
++                    in_proj = state_dict.pop(f"{prefix}layers.{outer_layer_idx}.conv.in_proj.weight")
++                    b_w, c_w, x_w = torch.chunk(in_proj, 3, dim=0)
++                    temp_state_dict[f"layers.{inner_layer_idx}.B_proj.weight"] = b_w
++                    temp_state_dict[f"layers.{inner_layer_idx}.C_proj.weight"] = c_w
++                    temp_state_dict[f"layers.{inner_layer_idx}.x_proj.weight"] = x_w
++                    temp_state_dict[f"layers.{inner_layer_idx}.conv.weight"] = state_dict.pop(
++                        f"{prefix}layers.{outer_layer_idx}.conv.conv.weight"
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.out_proj.weight"] = state_dict.pop(
++                        f"{prefix}layers.{outer_layer_idx}.conv.out_proj.weight"
++                    )
++                else:
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.q_proj.weight"] = state_dict.pop(
++                        f"{prefix}layers.{outer_layer_idx}.self_attn.q_proj.weight"
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.k_proj.weight"] = state_dict.pop(
++                        f"{prefix}layers.{outer_layer_idx}.self_attn.k_proj.weight"
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.v_proj.weight"] = state_dict.pop(
++                        f"{prefix}layers.{outer_layer_idx}.self_attn.v_proj.weight"
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.o_proj.weight"] = state_dict.pop(
++                        f"{prefix}layers.{outer_layer_idx}.self_attn.out_proj.weight"
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.q_norm.weight"] = state_dict.pop(
++                        f"{prefix}layers.{outer_layer_idx}.self_attn.q_layernorm.weight"
++                    ).to(torch.float32)
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.k_norm.weight"] = state_dict.pop(
++                        f"{prefix}layers.{outer_layer_idx}.self_attn.k_layernorm.weight"
++                    ).to(torch.float32)
++
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.q_proj.bias"] = state_dict.pop(
++                        f"{prefix}layers.{outer_layer_idx}.self_attn.q_proj.bias",
++                        torch.zeros(self.config.num_attention_heads * self.head_dim, dtype=self.dtype),
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.k_proj.bias"] = state_dict.pop(
++                        f"{prefix}layers.{outer_layer_idx}.self_attn.k_proj.bias",
++                        torch.zeros(self.config.num_key_value_heads * self.head_dim, dtype=self.dtype),
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.v_proj.bias"] = state_dict.pop(
++                        f"{prefix}layers.{outer_layer_idx}.self_attn.v_proj.bias",
++                        torch.zeros(self.config.num_key_value_heads * self.head_dim, dtype=self.dtype),
++                    )
++                    temp_state_dict[f"layers.{inner_layer_idx}.self_attn.o_proj.bias"] = state_dict.pop(
++                        f"{prefix}layers.{outer_layer_idx}.self_attn.o_proj.bias",
++                        torch.zeros(self.config.hidden_size, dtype=self.dtype),
++                    )
++
++            self.device_list.append("cpu")
++            outer_layer_idx += 1
++
++        if self.include_tail:
++            if fake_weights:
++                temp_state_dict["norm.weight"] = torch.rand(self.config.hidden_size, dtype=torch.float32)
++                temp_state_dict["lm_head.weight"] = torch.rand(
++                    self.config.vocab_size, self.config.hidden_size, dtype=self.dtype
++                )
++                temp_state_dict["lm_head.bias"] = torch.zeros(self.config.vocab_size, dtype=self.dtype)
++            else:
++                norm_key = f"{prefix}embedding_norm.weight"
++                if norm_key not in state_dict:
++                    norm_key = f"{prefix}norm.weight"
++                temp_state_dict["norm.weight"] = state_dict.pop(norm_key).to(torch.float32)
++
++                if self.config.tie_word_embeddings:
++                    lm_head_key = f"{prefix}embed_tokens.weight"
++                    temp_state_dict["lm_head.weight"] = state_dict[lm_head_key].clone()
++                else:
++                    lm_head_key = f"{prefix}lm_head.weight"
++                    temp_state_dict["lm_head.weight"] = state_dict.pop(lm_head_key)
++                temp_state_dict["lm_head.bias"] = state_dict.pop(
++                    f"{prefix}lm_head.bias",
++                    torch.zeros(self.config.vocab_size, dtype=self.dtype),
++                )
++
++        print(f"Loading weights for chunk {self.chunk_idx}")
++        missing = [k for k in self.state_dict().keys() if k not in temp_state_dict]
++        extra = [k for k in temp_state_dict.keys() if k not in self.state_dict()]
++        if missing or extra:
++            raise RuntimeError(f"Key mismatch for chunk {self.chunk_idx}:\nMissing: {missing}\nExtra: {extra}")
++
++        self.load_state_dict(temp_state_dict)
++        self.eval()
++        return self
++
++    def get_example_inputs(self, num_token: int = 128, cache_size: int = 512, get_dym_shape=False):
++        head_dim = int(self.head_dim)
++        example_inputs = (
++            torch.randn(1, num_token, self.config.hidden_size, device="cpu", dtype=torch.float32),
++            torch.randn(1, 1, num_token, cache_size + num_token, device="cpu", dtype=torch.float32),
++            torch.randn(1, 2, num_token, head_dim, device="cpu", dtype=torch.float32),
++            *[
++                torch.randn(
++                    1,
++                    self.config.num_key_value_heads,
++                    cache_size,
++                    head_dim,
++                    device="cpu",
++                    dtype=torch.float32,
++                )
++                for _ in range(2 * self.num_blocks)
++            ],
++        )
++        if get_dym_shape:
++            nt = Dim("num_token", max=num_token)
++            cache_dims = tuple(({} for _ in range(2 * self.num_blocks)))
++            dynamic_shapes = (
++                {0: Dim.STATIC, 1: nt, 2: Dim.STATIC},
++                {0: Dim.STATIC, 1: Dim.STATIC, 2: nt, 3: nt + cache_size},
++                {0: Dim.STATIC, 1: Dim.STATIC, 2: nt, 3: Dim.STATIC},
++                cache_dims,
++            )
++            return example_inputs, dynamic_shapes
++        return example_inputs

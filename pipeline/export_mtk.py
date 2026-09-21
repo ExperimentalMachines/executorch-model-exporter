@@ -28,7 +28,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from pipeline import eligibility, families, hub, manifest, naming, settings
+from pipeline import eligibility, families, gate, hub, manifest, naming, settings
 from pipeline.exporting import (
     ExportError,
     MemorySampler,
@@ -400,6 +400,7 @@ def run(
         },
         "metadata": {},
         "smoke": check,
+        "measuring_gate": gate.measuring_gate(check.get("stats")),
         "run": manifest.run_info(),
     }
     (backend_dir / "config.json").write_text(

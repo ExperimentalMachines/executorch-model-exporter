@@ -8,3 +8,5 @@ out/
 work/
 .local-out/
 .local-export-*.log
+uv.lock
+

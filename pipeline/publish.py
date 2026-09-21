@@ -258,6 +258,11 @@ def summary(out_dir: Path, backend: str, target: str | None = None, context: int
         rows.append(("Smoke test", f"{'passed' if smoke.get('passed') else 'failed'}: {smoke.get('reply', '')!r}"))
         if smoke.get("template_error"):
             rows.append(("Chat template", f"could not be rendered, completion prompt used: {smoke['template_error']}"))
+    measuring = report.get("measuring_gate") or {}
+    if measuring.get("prefill_tok_per_sec") is not None:
+        rows.append(("Prefill throughput", f"{measuring['prefill_tok_per_sec']:.2f} tok/s"))
+    if measuring.get("decode_tok_per_sec") is not None:
+        rows.append(("Decode throughput", f"{measuring['decode_tok_per_sec']:.2f} tok/s"))
     title = manifest.BACKEND_TITLES[backend] + (f" {manifest.target(report)}" if report.get("target") else "")
     lines = [f"### {title}: {report['output_repo']}", "", "| | |", "|---|---|"]
     lines += [f"| {k} | {v} |" for k, v in rows]

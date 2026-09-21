@@ -67,7 +67,7 @@ FAMILIES: tuple[Family, ...] = (
     Family(
         "lfm2",
         ("Lfm2ForCausalLM",),
-        {"vulkan": _LFM2_NO_VULKAN, "qnn": _LFM2_NO_QNN, "mtk": _MTK_NO_MODEL},
+        {"vulkan": _LFM2_NO_VULKAN, "qnn": _LFM2_NO_QNN},
     ),
     Family("qwen2_5", ("Qwen2ForCausalLM",)),
     Family("llama", ("LlamaForCausalLM",), {"mtk": _MTK_LLAMA}),
@@ -131,6 +131,7 @@ class MtkPlan:
 _MTK_SCRIPTS = {
     "qwen3": ("qwen.py", "qwen3.json", "qwen3"),
     "qwen2_5": ("qwen.py", "qwen.json", "qwen2"),
+    "lfm2": ("lfm2.py", "qwen3.json", "lfm2"),
 }
 
 

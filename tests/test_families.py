@@ -144,7 +144,8 @@ def test_lfm2_refuses_a_layer_type_list_that_does_not_match():
 def test_lfm2_is_not_offered_to_backends_without_a_definition():
     family = families.family_for(_lfm2_config())
     assert family.supports("xnnpack")
-    for backend in ("vulkan", "qnn", "mtk"):
+    assert family.supports("mtk")
+    for backend in ("vulkan", "qnn"):
         assert not family.supports(backend)
 
 

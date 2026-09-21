@@ -99,9 +99,8 @@ export:
     calib_tasks: [wikitext]
     calib_limit: 1
   mtk:
-    # NeuroPilot binaries are compiled per platform. The benchmark device is the Dimensity
-    # 9300+ (Galaxy Tab S10+) = MT6989 (DX3); add MT6991 (Dimensity 9400, DX4) when needed.
-    socs: [MT6989]
+    # NeuroPilot binaries are compiled per platform. MT6991 (Dimensity 9400, DX4).
+    socs: [MT6991]
     # MediaTek's LLM recipe (examples/mediatek/shell_scripts/export_*.sh): 16-bit
     # activations, 4-bit weights, the model cut into chunks of equal layer counts.
     precision: A16W4

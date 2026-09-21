@@ -64,8 +64,13 @@ def run(out_dir: Path, backend: str, work_dir: Path, gate_reference: Path | None
             instruct=report["source"].get("variant") == "instruct",
             total_params=arch.total_params,
         )
-        print(f"    reply: {result['reply']!r}")
         report["smoke"] = result
+        report["measuring_gate"] = gate.measuring_gate(result.get("stats"))
+        if report["measuring_gate"]["prefill_tok_per_sec"]:
+            print(
+                f"    measuring gate: prefill {report['measuring_gate']['prefill_tok_per_sec']} tok/s, "
+                f"decode {report['measuring_gate']['decode_tok_per_sec']} tok/s"
+            )
 
         # Generating is not the same as deciding. A file can answer the smoke question and
         # still have lost the tool call that made it worth exporting, which is what happened

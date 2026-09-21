@@ -30,6 +30,16 @@ def test_qwen_families_use_mediateks_qwen_script_and_their_chat_templates():
     assert families.mtk_plan(families.family_for(qwen25), qwen25, 4) == families.MtkPlan("qwen.py", "qwen.json", 4)
 
 
+def test_lfm2_uses_lfm2_script_and_chatml_preformatter():
+    cfg_1_2b = {"architectures": ["Lfm2ForCausalLM"], "model_type": "lfm2", "num_hidden_layers": 16}
+    plan_1_2b = families.mtk_plan(families.family_for(cfg_1_2b), cfg_1_2b, CFG.mtk.max_chunks)
+    assert plan_1_2b == families.MtkPlan("lfm2.py", "qwen3.json", 4)
+
+    cfg_2_6b = {"architectures": ["Lfm2ForCausalLM"], "model_type": "lfm2", "num_hidden_layers": 30}
+    plan_2_6b = families.mtk_plan(families.family_for(cfg_2_6b), cfg_2_6b, CFG.mtk.max_chunks)
+    assert plan_2_6b == families.MtkPlan("lfm2.py", "qwen3.json", 3)
+
+
 def test_rope_scaling_and_other_model_types_are_refused():
     config = hf_config("Qwen/Qwen3-0.6B") | {"rope_scaling": {"rope_type": "yarn", "factor": 4.0}}
     with pytest.raises(families.UnsupportedModel, match="RoPE scaling"):
