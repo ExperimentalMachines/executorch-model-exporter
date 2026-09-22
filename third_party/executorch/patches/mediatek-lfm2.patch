@@ -57,10 +57,10 @@ index 6c00bbb..9d5fa24 100644
                      from aot_utils.llm_utils.tokenizers_.tokenization_whisper import (
 diff --git a/examples/mediatek/model_export_scripts/lfm2.py b/examples/mediatek/model_export_scripts/lfm2.py
 new file mode 100644
-index 0000000..2b5a636
+index 0000000..c6a7e7d
 --- /dev/null
 +++ b/examples/mediatek/model_export_scripts/lfm2.py
-@@ -0,0 +1,518 @@
+@@ -0,0 +1,530 @@
 +# Copyright (c) MediaTek Inc.
 +# All rights reserved
 +#
@@ -493,7 +493,19 @@ index 0000000..2b5a636
 +    config, weight_dir, tokenizer_class, chunk_class = resolve_model_classes(
 +        args.config
 +    )
-+    tokenizer = tokenizer_class.from_pretrained(weight_dir)
++    try:
++        tokenizer = tokenizer_class.from_pretrained(weight_dir)
++    except Exception:
++        from transformers import PreTrainedTokenizerFast
++
++        tokenizer = PreTrainedTokenizerFast(
++            tokenizer_file=os.path.join(weight_dir, "tokenizer.json"),
++            bos_token_id=config.bos_token_id,
++            eos_token_id=config.eos_token_id,
++            pad_token_id=config.pad_token_id,
++        )
++    if getattr(tokenizer, "eos_token_id", None) is None:
++        tokenizer.eos_token_id = config.eos_token_id
 +    if args.preformatter is not None:
 +        preformatter = Preformatter(args.preformatter)
 +
