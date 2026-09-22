@@ -581,10 +581,10 @@ index 0000000..2b5a636
 +    main()
 diff --git a/examples/mediatek/models/llm_models/configuration_lfm2.py b/examples/mediatek/models/llm_models/configuration_lfm2.py
 new file mode 100644
-index 0000000..105f19b
+index 0000000..53074a1
 --- /dev/null
 +++ b/examples/mediatek/models/llm_models/configuration_lfm2.py
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,126 @@
 +# Copyright (c) MediaTek Inc.
 +# All rights reserved
 +#
@@ -628,9 +628,15 @@ index 0000000..105f19b
 +        self.hidden_size = hidden_size
 +        if self.hidden_size is None:
 +            raise KeyError("hidden_size is required but missing from config.json")
-+        self.intermediate_size = intermediate_size
-+        if self.intermediate_size is None:
++        if intermediate_size is None:
 +            raise KeyError("intermediate_size is required but missing from config.json")
++        if kwargs.get("block_auto_adjust_ff_dim", False):
++            ff = int(2 * int(kwargs.get("block_ff_dim") or intermediate_size) / 3)
++            ff = int(float(kwargs.get("block_ffn_dim_multiplier") or 1) * ff)
++            multiple = int(kwargs.get("block_multiple_of") or 256)
++            self.intermediate_size = multiple * ((ff + multiple - 1) // multiple)
++        else:
++            self.intermediate_size = intermediate_size
 +        self.num_hidden_layers = num_hidden_layers
 +        if self.num_hidden_layers is None:
 +            raise KeyError("num_hidden_layers is required but missing from config.json")
