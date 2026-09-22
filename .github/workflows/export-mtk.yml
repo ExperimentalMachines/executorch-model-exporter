@@ -42,11 +42,16 @@ concurrency:
 
 jobs:
   targets:
-    # Hub metadata only, no model download.
+    # Hub metadata only, no model download. ARM is fine here precisely because it never
+    # touches MediaTek's x86-only toolchain; it reads a config.json and does arithmetic.
     runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    env:
+      # The matrix now reads the model's config to size each window's runner, and some of
+      # the watched repos are private, so this job needs the token the export job has.
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
     outputs:
       socs: ${{ steps.socs.outputs.socs }}
-      contexts: ${{ steps.contexts.outputs.contexts }}
+      entries: ${{ steps.contexts.outputs.entries }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: socs
@@ -61,28 +66,18 @@ jobs:
       - id: contexts
         env:
           CONTEXTS: ${{ inputs.contexts }}
-        # Accepts a JSON list, one number, or a comma-separated list. Empty means every tier plus
-        # mtk.cache_size, MediaTek's own window: calibration memory grows with the window, and 512
-        # is the one built so far (docs/research, findings 22-24).
+          MODEL_ID: ${{ inputs.model_id }}
+          REVISION: ${{ inputs.revision }}
+        # One entry per window, each carrying the smallest runner that can build it. The
+        # sizing is pipeline.export_mtk.pick_runner, the same calibration_bytes and
+        # calibration_disk_bytes the export gates on, so the matrix and the job cannot
+        # disagree about whether a window fits. Memory is one prompt's calibration steps;
+        # disk is every prompt's, since writer_batch_size=1 put the rest in the Arrow cache.
         run: |
-          python3 -m pip install --quiet pyyaml
-          CONTEXTS=$(python3 - "$CONTEXTS" <<'PY'
-          import json, sys, yaml
-          raw = sys.argv[1].strip()
-          if not raw:
-              export = yaml.safe_load(open("config/pipeline.yaml"))["export"]
-              values = export["context_tiers"] + [export["mtk"]["cache_size"]]
-          else:
-              try:
-                  values = json.loads(raw)
-              except ValueError:
-                  values = [v for v in raw.strip("[]").split(",") if v.strip()]
-              if not isinstance(values, list):
-                  values = [values]
-          print(json.dumps(sorted({int(v) for v in values}, reverse=True)))
-          PY
-          )
-          echo "contexts=$CONTEXTS" >>"$GITHUB_OUTPUT"
+          python3 -m pip install --quiet -r requirements/dev.txt
+          entries=$(python3 -m pipeline mtk-matrix "$MODEL_ID" --revision "$REVISION" --contexts "$CONTEXTS")
+          echo "$entries"
+          echo "entries=$entries" >>"$GITHUB_OUTPUT"
 
   export:
     needs: targets
@@ -90,16 +85,15 @@ jobs:
       fail-fast: false
       matrix:
         soc: ${{ fromJSON(needs.targets.outputs.socs) }}
-        context: ${{ fromJSON(needs.targets.outputs.contexts) }}
+        entry: ${{ fromJSON(needs.targets.outputs.entries) }}
     # Stays on x86: mtk_converter 8.13.0 is a cp310 x86 build and the NeuroPilot SDK
     # ships x86_64 libraries (finding 14).
     #
-    # 32 vCPU for the memory, not the cores. Calibration holds a full fp32 cache per prompt
-    # and step at the full window (export_mtk.calibration_bytes), so the window the runner
-    # can reach is set by its RAM: the 8 vCPU runner's 32 GB plus swap tops out around a
-    # 2048 window, where 128 GB reaches 8192. The cores are welcome too, since roughly
-    # three quarters of an export parallelises, but they are not why this is here.
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    # Sized per window by the targets job above, because the cost is the window and not the
+    # model: a 2k export fits the smallest tier and a 32k one does not fit the largest
+    # without swap. Picking one size for all of them would either waste three quarters of
+    # the fleet on the small windows or fail the big ones.
+    runs-on: ${{ matrix.entry.runner }}
     timeout-minutes: 350
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -107,7 +101,7 @@ jobs:
       MODEL_ID: ${{ inputs.model_id }}
       REVISION: ${{ inputs.revision }}
       SOC: ${{ matrix.soc }}
-      CONTEXT: ${{ matrix.context }}
+      CONTEXT: ${{ matrix.entry.context }}
       MTK_MAX_CHUNKS: ${{ inputs.max_chunks }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -115,11 +109,10 @@ jobs:
       # The pipeline itself (fetch, reports, publishing) on the repo's usual Python.
       - uses: ./.github/actions/setup-export
         with:
-          # One prompt's calibration steps at a 32k window is about 150 GiB for the 2.6B
-          # (export_mtk.calibration_bytes), which is over the runner's 128 GB of RAM. Swap
-          # carries the difference: the tensors are written once and read back by the
-          # memory-mapped Arrow file, so paging costs time rather than correctness.
-          swap-gib: "64"
+          # Sized with the runner: enough to absorb an estimate that is low, without taking
+          # so much of the filesystem that the Arrow cache has nowhere to go. Only the 2.6B
+          # at 32k is expected to spend it, and pick_runner prefers a tier that does not.
+          swap-gib: "${{ matrix.entry.swap_gib }}"
           requirements: requirements/export-mtk.txt
 
       - name: Name things

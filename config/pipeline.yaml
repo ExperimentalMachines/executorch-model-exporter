@@ -127,3 +127,25 @@ export:
     # window that does not fit is skipped outright rather than calibrated on too little.
     # Each export report still records prompts_used, so a reader can see what was used.
     min_calibration_prompts: 4
+    # x86 Blacksmith runners, smallest first; export_mtk.pick_runner takes the first that
+    # carries a window. x86 because mtk_converter is a cp310 x86 wheel and mtk_neuron is
+    # tagged linux_x86_64, so no ARM tier can run the toolchain at all, whatever its size.
+    #
+    # Both numbers bind. Memory is one prompt's calibration steps; disk is every prompt's,
+    # because writer_batch_size=1 moved them to the Arrow cache. The 1.2B at 16k is the
+    # case that shows why disk is listed: it has the RAM for an 8vcpu runner and not the
+    # disk. swap_gib is what the workflow asks prepare-host.sh for on that tier, sized to
+    # leave the cache room on the same filesystem.
+    runner_tiers:
+      - label: blacksmith-8vcpu-ubuntu-2404
+        ram_bytes: 32000000000
+        disk_bytes: 160000000000
+        swap_gib: 24
+      - label: blacksmith-16vcpu-ubuntu-2404
+        ram_bytes: 64000000000
+        disk_bytes: 750000000000
+        swap_gib: 64
+      - label: blacksmith-32vcpu-ubuntu-2404
+        ram_bytes: 128000000000
+        disk_bytes: 1500000000000
+        swap_gib: 96

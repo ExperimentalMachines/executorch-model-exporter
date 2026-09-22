@@ -230,6 +230,51 @@ def test_calibration_disk_is_what_the_runner_tier_has_to_carry():
     assert export_mtk.calibration_disk_bytes(lfm, at_2k, 9) * 16 == cache
 
 
+def test_the_runner_is_sized_by_the_window_and_both_limits_bind():
+    lfm12 = {
+        "num_hidden_layers": 16,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 64,
+        "hidden_size": 2048,
+    }
+    lfm26 = dict(lfm12, num_hidden_layers=30)
+
+    def pick(config, window, params):
+        tier = export_mtk.pick_runner(config, dataclasses.replace(CFG.mtk, cache_size=window), 9, params)
+        return tier.label if tier else None
+
+    # The window sets the size, not the model: the same model wants three different tiers.
+    assert pick(lfm12, 2048, 1_170_340_608) == "blacksmith-8vcpu-ubuntu-2404"
+    assert pick(lfm12, 8192, 1_170_340_608) == "blacksmith-16vcpu-ubuntu-2404"
+    assert pick(lfm12, 32768, 1_170_340_608) == "blacksmith-32vcpu-ubuntu-2404"
+
+    # And the model matters at a fixed window, because both terms carry its shape.
+    assert pick(lfm26, 8192, 2_600_000_000) == "blacksmith-32vcpu-ubuntu-2404"
+
+    # Tiers are tried smallest first, so a window that fits the smallest never gets a
+    # bigger one: that is the saving this exists for.
+    smallest = CFG.mtk.runner_tiers[0]
+    assert pick(lfm12, 2048, 1_170_340_608) == smallest.label
+
+    # Nothing is handed a runner that cannot hold it. The 2.6B at 32k needs about 157 GiB
+    # against the largest tier's 128 GB, so it is the one window placed on swap, and it is
+    # still placed rather than dropped.
+    biggest = CFG.mtk.runner_tiers[-1]
+    assert pick(lfm26, 32768, 2_600_000_000) == biggest.label
+    at_32k = dataclasses.replace(CFG.mtk, cache_size=32768)
+    need = export_mtk.calibration_bytes(lfm26, at_32k, 9, 2_600_000_000)
+    assert need > biggest.ram_bytes
+    assert need < biggest.ram_bytes + biggest.swap_gib * 1024**3
+
+
+def test_no_runner_tier_is_arm_because_the_toolchain_is_x86_only():
+    # mtk_converter is a cp310 manylinux x86_64 wheel and mtk_neuron is tagged
+    # linux_x86_64. An ARM runner cannot install either, whatever its size.
+    for tier in CFG.mtk.runner_tiers:
+        assert "arm" not in tier.label
+
+
 def test_the_calibration_patch_adds_what_the_export_checks_for():
     patch = settings.ROOT / "third_party/executorch/patches/mediatek-calibration-as-arrays.patch"
     added = [line[1:].strip() for line in patch.read_text(encoding="utf-8").splitlines() if line.startswith("+ ")]

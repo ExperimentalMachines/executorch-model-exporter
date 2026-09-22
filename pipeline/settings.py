@@ -31,6 +31,16 @@ class QnnRecipe:
 
 
 @dataclass(frozen=True)
+class RunnerTier:
+    """A CI runner size, and what it can carry. Smallest first in MtkRecipe.runner_tiers."""
+
+    label: str
+    ram_bytes: int
+    disk_bytes: int
+    swap_gib: int
+
+
+@dataclass(frozen=True)
 class MtkRecipe:
     socs: tuple[str, ...]
     precision: str
@@ -40,6 +50,7 @@ class MtkRecipe:
     calibration: str
     response_cap: int
     min_calibration_prompts: int
+    runner_tiers: tuple[RunnerTier, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -128,6 +139,15 @@ def load() -> Settings:
             calibration=export["mtk"]["calibration"],
             response_cap=int(export["mtk"]["response_cap"]),
             min_calibration_prompts=int(export["mtk"]["min_calibration_prompts"]),
+            runner_tiers=tuple(
+                RunnerTier(
+                    label=str(tier["label"]),
+                    ram_bytes=int(tier["ram_bytes"]),
+                    disk_bytes=int(tier["disk_bytes"]),
+                    swap_gib=int(tier["swap_gib"]),
+                )
+                for tier in export["mtk"].get("runner_tiers", ())
+            ),
         ),
         executorch_version=versions["EXECUTORCH_VERSION"],
     )

@@ -145,7 +145,12 @@ class MemorySampler:
         }
 
 
-def host_budget(info: dict, reserve: int = 1_000_000_000) -> int | None:
+# What the host keeps for itself: the kernel, the runner agent and the shell the export
+# runs under. Subtracted from every budget so a plan that "just fits" is not counting it.
+RESERVE_BYTES = 1_000_000_000
+
+
+def host_budget(info: dict, reserve: int = RESERVE_BYTES) -> int | None:
     if info.get("mem_total_bytes") is None:
         return None
     return info["mem_total_bytes"] + (info.get("swap_total_bytes") or 0) - reserve

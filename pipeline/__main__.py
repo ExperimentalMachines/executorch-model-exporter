@@ -119,6 +119,46 @@ def _export_vulkan(args) -> int:
     )
 
 
+def _mtk_matrix(args) -> int:
+    """One matrix entry per window: the window and the smallest runner that can build it.
+
+    The workflow fans out on this rather than on a bare context list, so the runner size is
+    decided by the same calibration_bytes and calibration_disk_bytes the export itself gates
+    on. Two copies of that arithmetic, one in Python and one in YAML, would drift.
+    """
+    import dataclasses
+
+    from pipeline import export_mtk, hub, settings
+
+    cfg = settings.load()
+    source = hub.fetch(args.model, args.revision)
+    if not source.config or not source.total_params:
+        print(f"no config or parameter count for {args.model}", file=sys.stderr)
+        return 2
+    if args.contexts:
+        try:
+            wanted = json.loads(args.contexts)
+        except ValueError:
+            wanted = [v for v in args.contexts.strip("[]").split(",") if v.strip()]
+        if not isinstance(wanted, list):
+            wanted = [wanted]
+    else:
+        wanted = list(cfg.context_tiers) + [cfg.mtk.cache_size]
+
+    entries = []
+    for window in sorted({int(v) for v in wanted}, reverse=True):
+        recipe = dataclasses.replace(cfg.mtk, cache_size=window)
+        tier = export_mtk.pick_runner(source.config, recipe, args.prompts, source.total_params)
+        if tier is None:
+            # Left out rather than failed: the other windows are independent and a matrix
+            # that refuses to start teaches less than nine jobs that finish.
+            print(f"no runner tier can build a {window}-token window", file=sys.stderr)
+            continue
+        entries.append({"context": window, "runner": tier.label, "swap_gib": tier.swap_gib})
+    print(json.dumps(entries))
+    return 0
+
+
 def _export_mtk(args) -> int:
     from pipeline import export_mtk
 
@@ -300,6 +340,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     mtk.add_argument("--keep-work", action="store_true")
     mtk.set_defaults(func=_export_mtk)
+
+    matrix = commands.add_parser("mtk-matrix", help="windows and the runner each needs, as a CI matrix")
+    matrix.add_argument("model")
+    matrix.add_argument("--revision", default="main")
+    matrix.add_argument("--contexts", default="", help="JSON or comma-separated windows; empty for every tier")
+    matrix.add_argument(
+        "--prompts",
+        type=int,
+        default=9,
+        help="lines in mtk.calibration, which sets the disk the Arrow cache needs; the export "
+        "counts the real file and its disk gate catches a mismatch",
+    )
+    matrix.set_defaults(func=_mtk_matrix)
 
     watch = commands.add_parser("watch", help="check the watched orgs, dispatch exports, update state")
     watch.add_argument("--state", required=True, help="state JSON (on the state branch)")

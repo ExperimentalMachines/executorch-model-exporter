@@ -30,6 +30,7 @@ from pathlib import Path
 
 from pipeline import eligibility, families, gate, hub, manifest, naming, settings
 from pipeline.exporting import (
+    RESERVE_BYTES,
     ExportError,
     MemorySampler,
     SkipExport,
@@ -72,10 +73,15 @@ RUNNER_IO_TYPES = {
 # would now refuse up front.
 CALIBRATION_OVERHEAD = 3.8
 # On top of the prepared calibration inputs, the same filesystem carries the source
-# checkpoint, the chunk outputs, the swap file prepare-host.sh writes and the toolchain.
-# Measured on the 512 runs: a few GB of wheels, a 2.4 GB checkpoint, 1.2 GB of chunks and
-# whatever swap the workflow asked for, which is 64 GiB today.
-DISK_MARGIN_BYTES = 90 * 1024**3
+# checkpoint, the chunk outputs, the toolchain wheels and the Hub cache. Not the swap file:
+# prepare-host.sh writes it before the export starts, so the free space the gate reads has
+# already had it taken out. pick_runner, which runs before any of that exists, does subtract
+# it. Measured on the 512 runs: a 2.4 GB checkpoint, 1.2 GB of chunks, a few GB of wheels.
+DISK_MARGIN_BYTES = 26 * 1024**3
+# A window is only given to a runner it fits with room to spare. Exactly filling RAM means
+# swapping through the whole calibration, which turns an export into something that times
+# out rather than something that fails, and the next tier up is cheaper than finding out.
+RUNNER_HEADROOM = 0.85
 # model_export_scripts/qwen.py:454-480 keeps the whole checkpoint as a state_dict (16-bit as
 # published) and builds every chunk from it in fp32: 2 + 4 bytes per parameter.
 WEIGHT_BYTES_PER_PARAM = 6
@@ -171,6 +177,41 @@ def calibration_disk_bytes(config: dict, recipe: settings.MtkRecipe, prompts: in
     head_dim = int(c.get("head_dim") or int(c["hidden_size"]) // n_heads)
     kv_per_token = int(c["num_hidden_layers"]) * 2 * int(c.get("num_key_value_heads") or n_heads) * head_dim * 4
     return prompts * (1 + recipe.response_cap) * kv_per_token * recipe.cache_size
+
+
+def pick_runner(
+    config: dict,
+    recipe: settings.MtkRecipe,
+    prompts: int,
+    params: int,
+) -> settings.RunnerTier | None:
+    """The smallest configured runner that can build this window, or None if none can.
+
+    Two limits bind and they bind differently, which is why this is not a constant. Memory
+    is one prompt's calibration steps, so it grows with the window and the model. Disk is
+    *every* prompt's, because writer_batch_size=1 moved the rest to the Arrow cache. The
+    1.2B at 16k wants more memory than the smallest tier has; the 2.6B at 32k wants more
+    disk than the middle tier's swap leaves it.
+
+    Memory is asked for twice. A calibration that fits in RAM runs at the speed of the
+    forwards; one that fits only with swap reads a multi-gigabyte tensor back through the
+    pager on every step, which is the difference between an export that takes an hour and
+    one that takes the timeout. So a tier that holds the peak in RAM is preferred, and swap
+    is only spent when no tier can, which today is the 2.6B at 32k and nothing else.
+    """
+    need_ram = calibration_bytes(config, recipe, prompts, params)
+    need_disk = calibration_disk_bytes(config, recipe, prompts) + DISK_MARGIN_BYTES
+
+    def carries(tier: settings.RunnerTier, *, with_swap: bool) -> bool:
+        swap = tier.swap_gib * 1024**3
+        ram = tier.ram_bytes + (swap if with_swap else 0) - RESERVE_BYTES
+        return need_ram <= ram * RUNNER_HEADROOM and need_disk <= tier.disk_bytes - swap
+
+    for with_swap in (False, True):
+        for tier in recipe.runner_tiers:
+            if carries(tier, with_swap=with_swap):
+                return tier
+    return None
 
 
 def exp_name(weight_dir: Path, precision: str, chunks: int) -> str:
