@@ -207,6 +207,29 @@ def test_calibration_memory_estimate_covers_the_measured_peak_and_refuses_what_d
             assert export_mtk.calibration_bytes(lfm, recipe, 9, model_params) < budget
 
 
+def test_calibration_disk_is_what_the_runner_tier_has_to_carry():
+    # writer_batch_size=1 took the prompt count out of memory by putting every prompt's
+    # steps in the Arrow cache instead, so disk is now the constraint that picks the runner.
+    lfm = {
+        "num_hidden_layers": 16,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 64,
+        "hidden_size": 2048,
+    }
+    at_32k = dataclasses.replace(CFG.mtk, cache_size=32768)
+    cache = export_mtk.calibration_disk_bytes(lfm, at_32k, 9)
+    assert cache == 9 * 10 * 65_536 * 32_768  # 193 GB
+
+    # A blacksmith-8vcpu runner has 160 GB and cannot hold it; 16vcpu has 750 GB and can.
+    assert cache + export_mtk.DISK_MARGIN_BYTES > 160 * 10**9
+    assert cache + export_mtk.DISK_MARGIN_BYTES < 750 * 10**9
+
+    # It scales with the window, which is the whole point of checking per window.
+    at_2k = dataclasses.replace(CFG.mtk, cache_size=2048)
+    assert export_mtk.calibration_disk_bytes(lfm, at_2k, 9) * 16 == cache
+
+
 def test_the_calibration_patch_adds_what_the_export_checks_for():
     patch = settings.ROOT / "third_party/executorch/patches/mediatek-calibration-as-arrays.patch"
     added = [line[1:].strip() for line in patch.read_text(encoding="utf-8").splitlines() if line.startswith("+ ")]

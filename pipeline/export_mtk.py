@@ -71,6 +71,11 @@ RUNNER_IO_TYPES = {
 # prompt. That is what happened at a 2048 window on the 16.8 GB runner, which this value
 # would now refuse up front.
 CALIBRATION_OVERHEAD = 3.8
+# On top of the prepared calibration inputs, the same filesystem carries the source
+# checkpoint, the chunk outputs, the swap file prepare-host.sh writes and the toolchain.
+# Measured on the 512 runs: a few GB of wheels, a 2.4 GB checkpoint, 1.2 GB of chunks and
+# whatever swap the workflow asked for, which is 64 GiB today.
+DISK_MARGIN_BYTES = 90 * 1024**3
 # model_export_scripts/qwen.py:454-480 keeps the whole checkpoint as a state_dict (16-bit as
 # published) and builds every chunk from it in fp32: 2 + 4 bytes per parameter.
 WEIGHT_BYTES_PER_PARAM = 6
@@ -147,6 +152,25 @@ def calibration_bytes(config: dict, recipe: settings.MtkRecipe, prompts: int, pa
     steps = 1 + recipe.response_cap
     tensors = steps * kv_per_token * recipe.cache_size
     return int(tensors * CALIBRATION_OVERHEAD) + params * WEIGHT_BYTES_PER_PARAM
+
+
+def calibration_disk_bytes(config: dict, recipe: settings.MtkRecipe, prompts: int) -> int:
+    """Bytes the prepared calibration inputs occupy on disk.
+
+    writer_batch_size=1 keeps one prompt in memory, which is what makes a 32k window
+    possible, but the rows still all land in the Arrow cache datasets.map writes and are
+    read back once per chunk. So the volume did not go away, it moved: every prompt's every
+    step, each holding a full fp32 cache at the window. At 32k that is 193 GB for the 1.2B
+    and 362 GB for the 2.6B, which is more than the 160 GB a blacksmith-8vcpu runner has.
+
+    Not padded for the checkpoint, the outputs or the swap file: the caller adds those,
+    because it knows the sizes and this does not.
+    """
+    c = families.text_config(config)
+    n_heads = int(c["num_attention_heads"])
+    head_dim = int(c.get("head_dim") or int(c["hidden_size"]) // n_heads)
+    kv_per_token = int(c["num_hidden_layers"]) * 2 * int(c.get("num_key_value_heads") or n_heads) * head_dim * 4
+    return prompts * (1 + recipe.response_cap) * kv_per_token * recipe.cache_size
 
 
 def exp_name(weight_dir: Path, precision: str, chunks: int) -> str:
@@ -289,6 +313,20 @@ def run(
         raise SkipExport(
             f"calibration at a {window}-token cache needs about {needed:,} B for one prompt's "
             f"{1 + recipe.response_cap} steps, this host has {budget:,} B"
+        )
+
+    # And the same question for disk, because keeping one prompt in memory put every other
+    # prompt's steps in the Arrow cache instead. Filling the disk half way through shows up
+    # as a write error inside datasets with nothing pointing at the window, so it is worth a
+    # sentence up front. The margin covers the checkpoint, the chunk outputs and the swap
+    # file, which all sit on the same filesystem.
+    disk_needed = calibration_disk_bytes(source.config, recipe, prompts) + DISK_MARGIN_BYTES
+    work_dir.mkdir(parents=True, exist_ok=True)  # disk_usage needs it to exist
+    disk_free = shutil.disk_usage(work_dir).free
+    if disk_needed > disk_free:
+        raise SkipExport(
+            f"calibration at a {window}-token cache writes about {disk_needed:,} B of prepared "
+            f"inputs, this host has {disk_free:,} B free on {work_dir}"
         )
     dataset = recipe.calibration
     if prompts < len(lines):
