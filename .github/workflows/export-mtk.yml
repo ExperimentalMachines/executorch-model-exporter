@@ -20,6 +20,10 @@ on:
         description: JSON list of context windows in tokens, one job per chip and window; empty for every tier in config/pipeline.yaml plus mtk.cache_size
         default: ""
         type: string
+      max_chunks:
+        description: Maximum chunks to divide the model into (1, 2, 4); empty for mtk.max_chunks in config/pipeline.yaml
+        default: ""
+        type: string
       publish_hf:
         description: Publish to the Hugging Face org in config/pipeline.yaml
         default: true
@@ -98,6 +102,7 @@ jobs:
       REVISION: ${{ inputs.revision }}
       SOC: ${{ matrix.soc }}
       CONTEXT: ${{ matrix.context }}
+      MTK_MAX_CHUNKS: ${{ inputs.max_chunks }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

@@ -243,7 +243,8 @@ def run(
     if verdict.backends[BACKEND] is not None:
         raise ExportError(f"{model_id} cannot be exported to {BACKEND}: {verdict.backends[BACKEND]}")
     family = families.family_for(source.config)
-    plan = families.mtk_plan(family, source.config, recipe.max_chunks)
+    max_chunks = int(os.environ.get("MTK_MAX_CHUNKS") or recipe.max_chunks)
+    plan = families.mtk_plan(family, source.config, max_chunks)
     window = recipe.cache_size
     script = examples_dir / "model_export_scripts" / plan.script
     if PATCH_MARKER not in script.read_text(encoding="utf-8"):
