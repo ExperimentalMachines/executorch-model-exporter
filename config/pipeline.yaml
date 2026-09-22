@@ -117,11 +117,16 @@ export:
     # actually built come from context_tiers through the workflow's contexts input.
     prompt_tokens: 128
     cache_size: 512
-    # Calibration prompts shipped with examples/mediatek, wrapped in the family's chat
-    # template (MediaTek's scripts fall back to random inputs without them), and the
-    # generated tokens per prompt that calibrate the one-token graph (MediaTek's default 9).
+    # Calibration prompts shipped with examples/mediatek, and the generated tokens per
+    # prompt that calibrate the one-token graph (MediaTek's default 9). qwen.py calibrates on
+    # these alone, in the family's preformatter template. lfm2.py calibrates on the
+    # long-context corpus instead (pipeline/mtk_corpus.py): these nine as its short samples,
+    # rendered in the model's own chat template, plus long_samples conversations and passages
+    # that fill the window, because the activation observers are MinMax and a nine-prompt set
+    # of sixty tokens never shows them the positions a long context reaches.
     calibration: aot_utils/llm_utils/prompts/alpaca.txt
     response_cap: 9
+    long_samples: 14
     # Kept for the report and for older recipes: since writer_batch_size=1 the peak is one
     # prompt's steps whatever the corpus size, so no window trims the corpus any more and a
     # window that does not fit is skipped outright rather than calibrated on too little.
@@ -131,20 +136,27 @@ export:
     # carries a window. x86 because mtk_converter is a cp310 x86 wheel and mtk_neuron is
     # tagged linux_x86_64, so no ARM tier can run the toolchain at all, whatever its size.
     #
-    # Both numbers bind. Memory is one prompt's calibration steps; disk is every prompt's,
-    # because writer_batch_size=1 moved them to the Arrow cache. The 1.2B at 16k is the
-    # case that shows why disk is listed: it has the RAM for an 8vcpu runner and not the
+    # For qwen.py both numbers bind. Memory is one prompt's calibration steps; disk is every
+    # prompt's, because writer_batch_size=1 moved them to the Arrow cache. The 1.2B at 16k is
+    # the case that shows why disk is listed: it has the RAM for an 8vcpu runner and not the
     # disk. swap_gib is what the workflow asks prepare-host.sh for on that tier, sized to
     # leave the cache room on the same filesystem.
+    #
+    # lfm2.py calibrates in one streaming pass that keeps no step, so neither grows with the
+    # window much and time is what binds: max_window is the largest window a tier is given,
+    # so a 32k calibration, which runs a quarter of a million tokens through the model twice,
+    # lands on the cores that finish it inside the job limit.
     runner_tiers:
       - label: blacksmith-8vcpu-ubuntu-2404
         ram_bytes: 32000000000
         disk_bytes: 160000000000
         swap_gib: 24
+        max_window: 4096
       - label: blacksmith-16vcpu-ubuntu-2404
         ram_bytes: 64000000000
         disk_bytes: 750000000000
         swap_gib: 64
+        max_window: 16384
       - label: blacksmith-32vcpu-ubuntu-2404
         ram_bytes: 128000000000
         disk_bytes: 1500000000000

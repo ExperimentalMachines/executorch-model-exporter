@@ -28,7 +28,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from pipeline import eligibility, families, gate, hub, manifest, naming, settings
+from pipeline import eligibility, families, gate, hub, manifest, mtk_corpus, naming, settings
 from pipeline.exporting import (
     RESERVE_BYTES,
     ExportError,
@@ -89,6 +89,22 @@ WEIGHT_BYTES_PER_PARAM = 6
 # calibration reads every prepared row back as nested Python lists, ~35 min per prompt on
 # the hosted runner (docs/research, finding 17).
 PATCH_MARKER = 'cal_dataset = cal_dataset.with_format("numpy")'
+# third_party/executorch/patches/mediatek-lfm2.patch: lfm2.py calibrates every chunk in one
+# streaming pass over the long-context corpus (pipeline/mtk_corpus.py) and keeps no step, so
+# the Arrow round trip and the arrays patch do not apply to it.
+STREAMING_MARKER = "def calibrate_streaming("
+STREAMING_SCRIPTS = frozenset({"lfm2.py"})
+# What streaming calibration holds: the checkpoint (2 bytes per parameter), the fp32 chunks (4)
+# and every chunk's prepared graph (4); per step the whole cache a few times over (the input,
+# the chunks' outputs, their concatenation and its clone) and one block's attention scores.
+# Measured on the 1.2B at 512 on the host it was written on: 9.1 GB against 11.9 estimated.
+STREAMING_WEIGHT_BYTES_PER_PARAM = 10
+STREAMING_CACHE_COPIES = 4
+# Lowering peaks above calibration on every export measured so far, at a peak_in_use_bytes of
+# 18.4 GB for the 1.2B and 38.8 GB for the 2.6B (the published 512 export reports), 15.7 and
+# 14.4 bytes per parameter, and 17.8 GB for the 1.2B at 4k, so it does not grow with the window.
+LOWERING_BYTES_PER_PARAM = 16
+REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_PACKAGES = ("executorch", "torch", "torchao", "transformers", "mtk_converter", "mtk-neuron")
 
 _LOAD_PROGRAM = """
@@ -126,8 +142,12 @@ def export_command(
         dataset or recipe.calibration,
         "--response_cap",
         str(recipe.response_cap),
-        "--preformatter",
-        f"aot_utils/llm_utils/preformatter_templates/{plan.preformatter}",
+        # A .jsonl corpus is already rendered in the model's own chat template.
+        *(
+            []
+            if (dataset or "").endswith(".jsonl")
+            else ["--preformatter", f"aot_utils/llm_utils/preformatter_templates/{plan.preformatter}"]
+        ),
         "-shapes",
         f"{recipe.prompt_tokens}t{window}c",
         f"1t{window}c",
@@ -136,7 +156,27 @@ def export_command(
     ]
 
 
-def calibration_bytes(config: dict, recipe: settings.MtkRecipe, prompts: int, params: int) -> int:
+def streaming_bytes(config: dict, recipe: settings.MtkRecipe, params: int) -> int:
+    """Estimated peak of RAM + swap in use for lfm2.py's streaming calibration or for the
+    lowering after it, whichever is higher.
+
+    Nothing is kept per step, so the window enters once, as the cache every step carries and
+    one prompt block's attention scores over it, and the corpus size does not enter at all.
+    """
+    c = families.text_config(config)
+    n_heads = int(c["num_attention_heads"])
+    head_dim = int(c.get("head_dim") or int(c["hidden_size"]) // n_heads)
+    kv_per_token = int(c["num_hidden_layers"]) * 2 * int(c.get("num_key_value_heads") or n_heads) * head_dim * 4
+    window = recipe.cache_size
+    cache = kv_per_token * window * STREAMING_CACHE_COPIES
+    scores = 3 * n_heads * recipe.prompt_tokens * (window + recipe.prompt_tokens) * 4
+    calibrate = params * STREAMING_WEIGHT_BYTES_PER_PARAM + cache + scores
+    return max(calibrate, params * LOWERING_BYTES_PER_PARAM)
+
+
+def calibration_bytes(
+    config: dict, recipe: settings.MtkRecipe, prompts: int, params: int, *, streaming: bool = False
+) -> int:
     """Estimated peak of RAM + swap in use while MediaTek's script prepares calibration inputs,
     the export's peak (docs/research, findings 15, 23, 25).
 
@@ -149,8 +189,11 @@ def calibration_bytes(config: dict, recipe: settings.MtkRecipe, prompts: int, pa
     once, which is what held the window at 512.
 
     [prompts] no longer changes the answer and is kept so callers and the report read the
-    same way; it is asserted against rather than multiplied in.
+    same way; it is asserted against rather than multiplied in. With ``streaming`` (lfm2.py)
+    the estimate is streaming_bytes instead.
     """
+    if streaming:
+        return streaming_bytes(config, recipe, params)
     c = families.text_config(config)
     n_heads = int(c["num_attention_heads"])
     head_dim = int(c.get("head_dim") or int(c["hidden_size"]) // n_heads)
@@ -160,7 +203,7 @@ def calibration_bytes(config: dict, recipe: settings.MtkRecipe, prompts: int, pa
     return int(tensors * CALIBRATION_OVERHEAD) + params * WEIGHT_BYTES_PER_PARAM
 
 
-def calibration_disk_bytes(config: dict, recipe: settings.MtkRecipe, prompts: int) -> int:
+def calibration_disk_bytes(config: dict, recipe: settings.MtkRecipe, prompts: int, *, streaming: bool = False) -> int:
     """Bytes the prepared calibration inputs occupy on disk.
 
     writer_batch_size=1 keeps one prompt in memory, which is what makes a 32k window
@@ -172,6 +215,8 @@ def calibration_disk_bytes(config: dict, recipe: settings.MtkRecipe, prompts: in
     Not padded for the checkpoint, the outputs or the swap file: the caller adds those,
     because it knows the sizes and this does not.
     """
+    if streaming:
+        return 0  # lfm2.py keeps no step, so nothing goes to the Arrow cache
     c = families.text_config(config)
     n_heads = int(c["num_attention_heads"])
     head_dim = int(c.get("head_dim") or int(c["hidden_size"]) // n_heads)
@@ -184,6 +229,8 @@ def pick_runner(
     recipe: settings.MtkRecipe,
     prompts: int,
     params: int,
+    *,
+    streaming: bool = False,
 ) -> settings.RunnerTier | None:
     """The smallest configured runner that can build this window, or None if none can.
 
@@ -198,14 +245,19 @@ def pick_runner(
     pager on every step, which is the difference between an export that takes an hour and
     one that takes the timeout. So a tier that holds the peak in RAM is preferred, and swap
     is only spent when no tier can, which today is the 2.6B at 32k and nothing else.
+
+    With ``streaming`` (lfm2.py) neither grows much with the window and the time does, so a
+    tier is also held to its max_window: a 32k calibration runs a quarter of a million tokens
+    through the model twice, and the cores decide whether that fits the job limit.
     """
-    need_ram = calibration_bytes(config, recipe, prompts, params)
-    need_disk = calibration_disk_bytes(config, recipe, prompts) + DISK_MARGIN_BYTES
+    need_ram = calibration_bytes(config, recipe, prompts, params, streaming=streaming)
+    need_disk = calibration_disk_bytes(config, recipe, prompts, streaming=streaming) + DISK_MARGIN_BYTES
 
     def carries(tier: settings.RunnerTier, *, with_swap: bool) -> bool:
         swap = tier.swap_gib * 1024**3
         ram = tier.ram_bytes + (swap if with_swap else 0) - RESERVE_BYTES
-        return need_ram <= ram * RUNNER_HEADROOM and need_disk <= tier.disk_bytes - swap
+        fast_enough = not streaming or tier.max_window is None or recipe.cache_size <= tier.max_window
+        return need_ram <= ram * RUNNER_HEADROOM and need_disk <= tier.disk_bytes - swap and fast_enough
 
     for with_swap in (False, True):
         for tier in recipe.runner_tiers:
@@ -326,7 +378,12 @@ def run(
     plan = families.mtk_plan(family, source.config, max_chunks)
     window = recipe.cache_size
     script = examples_dir / "model_export_scripts" / plan.script
-    if PATCH_MARKER not in script.read_text(encoding="utf-8"):
+    streaming = plan.script in STREAMING_SCRIPTS
+    if streaming and STREAMING_MARKER not in script.read_text(encoding="utf-8"):
+        raise ExportError(
+            f"{script} lacks the streaming calibration in third_party/executorch/patches/mediatek-lfm2.patch"
+        )
+    if not streaming and PATCH_MARKER not in script.read_text(encoding="utf-8"):
         raise ExportError(f"{script} lacks third_party/executorch/patches/mediatek-calibration-as-arrays.patch")
 
     output_repo = naming.output_repo(model_id, cfg.hub_org, cfg.repo_suffix)
@@ -347,13 +404,17 @@ def run(
     prompts_text = (examples_dir / recipe.calibration).read_text(encoding="utf-8")
     lines = [line for line in prompts_text.splitlines() if line.strip()]
     budget = host_budget(host_info())
-    prompts = len(lines)
+    prompts = len(lines) + (recipe.long_samples if streaming else 0)
     params = source.total_params  # eligibility refuses a model without it
-    needed = calibration_bytes(source.config, recipe, prompts, params)
+    needed = calibration_bytes(source.config, recipe, prompts, params, streaming=streaming)
     if budget is not None and needed > budget:
+        what = (
+            "the streaming calibration and the lowering"
+            if streaming
+            else f"one prompt's {1 + recipe.response_cap} steps"
+        )
         raise SkipExport(
-            f"calibration at a {window}-token cache needs about {needed:,} B for one prompt's "
-            f"{1 + recipe.response_cap} steps, this host has {budget:,} B"
+            f"calibration at a {window}-token cache needs about {needed:,} B for {what}, this host has {budget:,} B"
         )
 
     # And the same question for disk, because keeping one prompt in memory put every other
@@ -361,7 +422,7 @@ def run(
     # as a write error inside datasets with nothing pointing at the window, so it is worth a
     # sentence up front. The margin covers the checkpoint, the chunk outputs and the swap
     # file, which all sit on the same filesystem.
-    disk_needed = calibration_disk_bytes(source.config, recipe, prompts) + DISK_MARGIN_BYTES
+    disk_needed = calibration_disk_bytes(source.config, recipe, prompts, streaming=streaming) + DISK_MARGIN_BYTES
     work_dir.mkdir(parents=True, exist_ok=True)  # disk_usage needs it to exist
     disk_free = shutil.disk_usage(work_dir).free
     if disk_needed > disk_free:
@@ -392,6 +453,27 @@ def run(
     hub.download(source, weight_dir)
     tokenizer, licenses = copy_side_files(source, weight_dir, out_dir)
     bos, eos = hub.special_token_ids(source)
+
+    corpus = None
+    if streaming:
+        sources_dir = work_dir / "calibration-sources"
+        mtk_corpus.fetch(sources_dir)
+        dataset = str((work_dir / f"calibration-{window}.jsonl").resolve())
+        summary_path = work_dir / f"calibration-{window}.json"
+        build_env = tool_env(tool_python, dict(os.environ))
+        build_env["PYTHONPATH"] = os.pathsep.join(p for p in (str(REPO_ROOT), build_env.get("PYTHONPATH")) if p)
+        subprocess.run(
+            [
+                tool_python, "-m", "pipeline.mtk_corpus",
+                "--weights", str(weight_dir), "--sources", str(sources_dir),
+                "--window", str(window), "--response-cap", str(recipe.response_cap),
+                "--samples", str(recipe.long_samples),
+                "--short-prompts", str(examples_dir / recipe.calibration),
+                "--out", dataset, "--summary", str(summary_path),
+            ],
+            check=True, cwd=REPO_ROOT, env=build_env,
+        )  # fmt: skip
+        corpus = json.loads(summary_path.read_text(encoding="utf-8"))
 
     command = export_command(tool_python, plan, recipe, soc, weight_dir / "config.json", dataset)
     print("==> " + " ".join(command))
@@ -449,20 +531,30 @@ def run(
             "num_chunks": plan.num_chunks,
             "prompt_tokens": recipe.prompt_tokens,
             "cache_size": window,
-            "calibration": {
-                "prompts": recipe.calibration,
-                "prompts_used": prompts,
-                "prompts_available": len(lines),
-                "preformatter": plan.preformatter,
-            },
+            "calibration": (
+                {**corpus, "short_prompts": recipe.calibration}
+                if corpus
+                else {
+                    "prompts": recipe.calibration,
+                    "prompts_used": prompts,
+                    "prompts_available": len(lines),
+                    "preformatter": plan.preformatter,
+                }
+            ),
             "label": f"NeuroPilot {recipe.precision}, {plan.num_chunks} chunks",
             "description": (
                 f"ExecuTorch {tools['executorch']} MediaTek LLM export (`examples/mediatek`, "
                 f"`{plan.script}`): {recipe.precision} (16-bit activations, "
-                f"{recipe.precision.rsplit('W', 1)[-1]}-bit weights) calibrated on MediaTek's "
-                f"`{recipe.calibration.rsplit('/', 1)[-1]}` prompts ({prompts} of {len(lines)}) in the "
-                f"{plan.preformatter} chat "
-                f"template, cut into {plan.num_chunks} chunks, with a {recipe.prompt_tokens}-token "
+                f"{recipe.precision.rsplit('W', 1)[-1]}-bit weights) calibrated on "
+                + (
+                    f"{mtk_corpus.describe(corpus)}, "
+                    if corpus
+                    else (
+                        f"MediaTek's `{recipe.calibration.rsplit('/', 1)[-1]}` prompts ({prompts} of "
+                        f"{len(lines)}) in the {plan.preformatter} chat template, "
+                    )
+                )
+                + f"cut into {plan.num_chunks} chunks, with a {recipe.prompt_tokens}-token "
                 f"prompt graph and a one-token generation graph over a {window}-token cache, "
                 f"compiled with MediaTek NeuroPilot Express SDK (mtk_converter {sdk['mtk_converter']}, "
                 f"mtk_neuron {sdk['mtk_neuron']}) for {soc} ({SOC_NAMES[soc]})."

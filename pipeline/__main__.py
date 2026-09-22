@@ -128,7 +128,7 @@ def _mtk_matrix(args) -> int:
     """
     import dataclasses
 
-    from pipeline import export_mtk, hub, settings
+    from pipeline import export_mtk, families, hub, settings
 
     cfg = settings.load()
     source = hub.fetch(args.model, args.revision)
@@ -145,10 +145,15 @@ def _mtk_matrix(args) -> int:
     else:
         wanted = list(cfg.context_tiers) + [cfg.mtk.cache_size]
 
+    # lfm2.py streams its calibration and sizes differently from MediaTek's Arrow round trip.
+    family = families.family_for(source.config)
+    plan = families.mtk_plan(family, source.config, cfg.mtk.max_chunks) if family else None
+    streaming = plan is not None and plan.script in export_mtk.STREAMING_SCRIPTS
+
     entries = []
     for window in sorted({int(v) for v in wanted}, reverse=True):
         recipe = dataclasses.replace(cfg.mtk, cache_size=window)
-        tier = export_mtk.pick_runner(source.config, recipe, args.prompts, source.total_params)
+        tier = export_mtk.pick_runner(source.config, recipe, args.prompts, source.total_params, streaming=streaming)
         if tier is None:
             # Left out rather than failed: the other windows are independent and a matrix
             # that refuses to start teaches less than nine jobs that finish.

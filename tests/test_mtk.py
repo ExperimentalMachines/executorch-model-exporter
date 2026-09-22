@@ -296,3 +296,93 @@ def test_the_export_script_starts_with_mtk_neurons_lib_on_the_loader_path(monkey
     assert env["LD_LIBRARY_PATH"] == f"{lib}:/opt/x"
     assert env["HOME"] == "/h" and env["PYTHONUNBUFFERED"] == "1"
     assert export_mtk.tool_env("p", {})["LD_LIBRARY_PATH"] == lib
+
+
+LFM12 = {
+    "num_hidden_layers": 16,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "head_dim": 64,
+    "hidden_size": 2048,
+}
+LFM26 = dict(LFM12, num_hidden_layers=30)
+
+
+def test_the_corpus_fills_every_window_and_leaves_room_for_the_replies():
+    from pipeline import mtk_corpus
+
+    for window in (512, 2048, 32768):
+        planned = mtk_corpus.plan(window, CFG.mtk.response_cap, CFG.mtk.long_samples, 9)
+        assert [kind for kind, _ in planned[:9]] == ["short"] * 9
+        long_targets = [target for kind, target in planned if kind != "short"]
+        # The longest sample reaches the last position a prompt can hold, so every position
+        # the window has is observed; nothing is longer, or the replies would not fit.
+        assert max(long_targets) == window - CFG.mtk.response_cap - 1
+        assert long_targets == sorted(long_targets)
+        kinds = [kind for kind, _ in planned[9:]]
+        assert kinds.count("chat") == kinds.count("document") == CFG.mtk.long_samples // 2
+
+
+def test_the_corpus_description_names_its_sources_and_what_it_filled():
+    from pipeline import mtk_corpus
+
+    summary = {
+        "samples": 23,
+        "kinds": {"short": 9, "chat": 7, "document": 7},
+        "fill_min": 15,
+        "fill_max": 32758,
+        "tokens_total": 247000,
+    }
+    text = mtk_corpus.describe(summary)
+    for needle in ("UltraChat 200k", "PG19", "alpaca.txt", "32,758", "own chat template"):
+        assert needle in text
+
+
+def test_the_lfm2_patch_carries_the_streaming_calibration_the_export_checks_for():
+    patch = settings.ROOT / "third_party/executorch/patches/mediatek-lfm2.patch"
+    added = [line[1:] for line in patch.read_text(encoding="utf-8").splitlines() if line.startswith("+")]
+    assert any(line.startswith(export_mtk.STREAMING_MARKER) for line in added)
+    lfm = {"architectures": ["Lfm2ForCausalLM"], "model_type": "lfm2", "num_hidden_layers": 16}
+    assert plan(config=lfm).script in export_mtk.STREAMING_SCRIPTS
+    # Qwen keeps MediaTek's own script and its Arrow round trip, with the arrays patch.
+    assert plan().script not in export_mtk.STREAMING_SCRIPTS
+
+
+def test_a_rendered_corpus_is_passed_without_mediateks_preformatter(tmp_path):
+    corpus = str(tmp_path / "calibration-4096.jsonl")
+    command = export_mtk.export_command("p", plan(), CFG.mtk, "MT6991", tmp_path, corpus)
+    assert flag(command, "--dataset") == corpus
+    assert "--preformatter" not in command
+    # The prompt file still goes through the preformatter, as MediaTek's scripts expect.
+    assert "--preformatter" in export_mtk.export_command("p", plan(), CFG.mtk, "MT6991", tmp_path)
+
+
+def test_streaming_calibration_keeps_nothing_on_disk_and_barely_grows_with_the_window():
+    at = {w: dataclasses.replace(CFG.mtk, cache_size=w) for w in (512, 32768)}
+    for config, params in ((LFM12, 1_170_340_608), (LFM26, 2_697_198_592)):
+        assert export_mtk.calibration_disk_bytes(config, at[32768], 23, streaming=True) == 0
+        small = export_mtk.calibration_bytes(config, at[512], 23, params, streaming=True)
+        large = export_mtk.calibration_bytes(config, at[32768], 23, params, streaming=True)
+        # Lowering sets the floor, measured at 15.7 and 14.4 bytes per parameter.
+        assert small >= params * 14.4
+        assert large < small * 1.2
+        # Against MediaTek's Arrow round trip at the same window: 88.6 and 169 GB.
+        assert large < export_mtk.calibration_bytes(config, at[32768], 9, params) / 2
+
+
+def test_streaming_windows_go_to_the_cores_that_finish_them():
+    def pick(config, window, params):
+        recipe = dataclasses.replace(CFG.mtk, cache_size=window)
+        tier = export_mtk.pick_runner(config, recipe, 23, params, streaming=True)
+        return tier.label if tier else None
+
+    assert pick(LFM12, 2048, 1_170_340_608) == "blacksmith-8vcpu-ubuntu-2404"
+    assert pick(LFM12, 4096, 1_170_340_608) == "blacksmith-8vcpu-ubuntu-2404"
+    assert pick(LFM12, 16384, 1_170_340_608) == "blacksmith-16vcpu-ubuntu-2404"
+    assert pick(LFM12, 32768, 1_170_340_608) == "blacksmith-32vcpu-ubuntu-2404"
+    # The 2.6B's lowering needs more than the smallest tier holds in RAM at any window, and
+    # its 32k window is a time question, not a memory one: it no longer needs swap.
+    assert pick(LFM26, 2048, 2_697_198_592) == "blacksmith-16vcpu-ubuntu-2404"
+    biggest = CFG.mtk.runner_tiers[-1]
+    at_32k = dataclasses.replace(CFG.mtk, cache_size=32768)
+    assert export_mtk.calibration_bytes(LFM26, at_32k, 23, 2_697_198_592, streaming=True) < biggest.ram_bytes

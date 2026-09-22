@@ -38,6 +38,9 @@ class RunnerTier:
     ram_bytes: int
     disk_bytes: int
     swap_gib: int
+    # Largest window this tier is given when calibration streams (lfm2.py), where memory no
+    # longer grows with the window and the time does. None means no limit.
+    max_window: int | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,8 @@ class MtkRecipe:
     response_cap: int
     min_calibration_prompts: int
     runner_tiers: tuple[RunnerTier, ...] = ()
+    # Long samples in the streaming corpus (pipeline/mtk_corpus.py), besides the short prompts.
+    long_samples: int = 14
 
 
 @dataclass(frozen=True)
@@ -139,12 +144,14 @@ def load() -> Settings:
             calibration=export["mtk"]["calibration"],
             response_cap=int(export["mtk"]["response_cap"]),
             min_calibration_prompts=int(export["mtk"]["min_calibration_prompts"]),
+            long_samples=int(export["mtk"].get("long_samples", 14)),
             runner_tiers=tuple(
                 RunnerTier(
                     label=str(tier["label"]),
                     ram_bytes=int(tier["ram_bytes"]),
                     disk_bytes=int(tier["disk_bytes"]),
                     swap_gib=int(tier["swap_gib"]),
+                    max_window=int(tier["max_window"]) if tier.get("max_window") else None,
                 )
                 for tier in export["mtk"].get("runner_tiers", ())
             ),

@@ -57,10 +57,10 @@ index 6c00bbb..9d5fa24 100644
                      from aot_utils.llm_utils.tokenizers_.tokenization_whisper import (
 diff --git a/examples/mediatek/model_export_scripts/lfm2.py b/examples/mediatek/model_export_scripts/lfm2.py
 new file mode 100644
-index 0000000..c6a7e7d
+index 0000000..c34c6ba
 --- /dev/null
 +++ b/examples/mediatek/model_export_scripts/lfm2.py
-@@ -0,0 +1,537 @@
+@@ -0,0 +1,501 @@
 +# Copyright (c) MediaTek Inc.
 +# All rights reserved
 +#
@@ -73,6 +73,7 @@ index 0000000..c6a7e7d
 +if os.getcwd() not in sys.path:
 +    sys.path.append(os.getcwd())
 +import argparse
++import json
 +import struct
 +import warnings
 +
@@ -225,22 +226,25 @@ index 0000000..c6a7e7d
 +    print()
 +
 +
-+def apply_preformatter(inp, preformatter=None):
-+    formatted_text = preformatter.generate_prompt(inp["text"])
-+    inp["text"] = formatted_text
-+    print(f"Formatted Prompt:\n{formatted_text}")
-+    return inp
++def load_samples(dataset, tokenizer, preformatter=None):
++    """Token ids per calibration sample.
 +
-+
-+def tokenize_dataset(inp, tokenizer):
-+    text = inp["text"]
-+    inp_encoded = tokenizer(text, return_tensors="pt")
-+    inp_encoded.pop("attention_mask", None)
-+    inp_encoded = inp_encoded["input_ids"]
-+    inp_encoded = inp_encoded.to(torch.int32)
-+    inp["input_ids"] = inp_encoded
-+    inp.pop("text", None)
-+    return inp
++    A .jsonl file holds samples the exporter already rendered in the model's chat template and
++    tokenized (executorch-model-exporter, pipeline/mtk_corpus.py) and is used as it is. Anything
++    else is MediaTek's format, one prompt per line, wrapped in the preformatter and tokenized
++    here exactly as before.
++    """
++    if dataset.endswith(".jsonl"):
++        with open(dataset, encoding="utf-8") as f:
++            return [json.loads(line)["input_ids"] for line in f if line.strip()]
++    samples = []
++    for row in load_dataset("text", data_files=dataset, split="train"):
++        text = row["text"]
++        if preformatter is not None:
++            text = preformatter.generate_prompt(text)
++            print(f"Formatted Prompt:\n{text}")
++        samples.append(tokenizer(text, return_tensors="pt")["input_ids"][0].tolist())
++    return samples
 +
 +
 +def reset_cache(
@@ -261,140 +265,92 @@ index 0000000..c6a7e7d
 +    return cache
 +
 +
-+def forward_and_save(
-+    models,
-+    hidden_state,
-+    cache,
-+    mask,
-+    pos_emb,
-+    model_input_dict,
-+    num_blocks_per_chunk,
-+    batch_name,
-+):
-+    for chunk_idx in range(len(models)):
-+        cache_in = cache[chunk_idx]
-+
-+        try:
-+            model_input_dict[str(chunk_idx)] = {
-+                **model_input_dict[str(chunk_idx)],
-+                batch_name: {
-+                    "hidden_state": hidden_state,
-+                    "mask": mask,
-+                    "pos_emb": pos_emb,
-+                    "cache": cache_in,
-+                },
-+            }
-+        except Exception:
-+            model_input_dict[str(chunk_idx)] = {
-+                batch_name: {
-+                    "hidden_state": hidden_state,
-+                    "mask": mask,
-+                    "pos_emb": pos_emb,
-+                    "cache": cache_in,
-+                }
-+            }
-+        with torch.no_grad():
-+            model_out = models[chunk_idx](
-+                hidden_state, mask, pos_emb, *torch.split(cache_in, 1, dim=0)
-+            )
-+        hidden_state = model_out[0]
-+        cache[chunk_idx] = torch.cat(
-+            model_out[1 : 1 + 2 * num_blocks_per_chunk[chunk_idx]], dim=0
-+        ).clone()
++def run_step(models, prepared, hidden_state, cache, mask, pos_emb, num_blocks_per_chunk):
++    """One step through every chunk. Each chunk's observers see its inputs, then the fp32 chunk
++    computes the hidden state and the cache that the next chunk and the next step read."""
++    with torch.no_grad():
++        for chunk_idx, model in enumerate(models):
++            cache_in = torch.split(cache[chunk_idx], 1, dim=0)
++            prepared[chunk_idx](hidden_state, mask, pos_emb, *cache_in)
++            model_out = model(hidden_state, mask, pos_emb, *cache_in)
++            hidden_state = model_out[0]
++            cache[chunk_idx] = torch.cat(
++                model_out[1 : 1 + 2 * num_blocks_per_chunk[chunk_idx]], dim=0
++            ).clone()
 +    return hidden_state, cache
 +
 +
-+def prepare_model_inputs(
-+    inp,
++def calibrate_streaming(
++    samples,
 +    models,
++    prepared,
 +    embedding_layer,
 +    master_rot_emb,
 +    num_blocks_per_chunk,
 +    num_key_value_heads,
 +    head_dim,
 +    max_cache_size,
++    max_num_token,
 +    eos_token_id_tensor,
 +    response_cap,
 +):
-+    model_input_dict = {str(i): None for i in range(len(models))}
-+    input_ids = inp.pop("input_ids")
-+    hidden_state = embedding_layer(torch.tensor(input_ids))
-+    input_length = hidden_state.shape[1]
-+    mask = generate_mask(max_cache_size, 0, input_length, input_length)
-+    pos_emb = master_rot_emb[:, :, :input_length, :]
-+    cache = reset_cache(
-+        len(models), num_key_value_heads, num_blocks_per_chunk, head_dim, max_cache_size
-+    )
-+    logits, cache = forward_and_save(
-+        models,
-+        hidden_state,
-+        cache,
-+        mask,
-+        pos_emb,
-+        model_input_dict,
-+        num_blocks_per_chunk,
-+        "prompt",
-+    )
-+    next_token_logits = logits[:, -1, :]
-+    next_token = torch.argmax(next_token_logits, dim=-1)
-+    response_count = 0
-+    seq_length = input_length
-+    while True:
-+        curr_input_id = next_token[:, None].to(torch.int32)
-+        input_length = curr_input_id.shape[1]
-+        hidden_state = embedding_layer(curr_input_id)
-+        mask = generate_mask(max_cache_size, seq_length, input_length, input_length)
-+        pos_emb = master_rot_emb[:, :, seq_length : seq_length + input_length, :]
-+        logits, cache = forward_and_save(
-+            models,
-+            hidden_state,
-+            cache,
-+            mask,
-+            pos_emb,
-+            model_input_dict,
-+            num_blocks_per_chunk,
-+            f"response{response_count}",
++    """Calibrate every chunk in one pass, keeping no step.
++
++    MediaTek's version prepared every step of every prompt with a full fp32 cache, wrote them to
++    an Arrow cache and read them back once per chunk: 193 GB for a 1.2B model at a 32k window,
++    through a round trip measured at about 85 MB/s. The observers are MinMax
++    (backends/mediatek/quantizer/qconfig.py), so what they record depends only on which inputs
++    each chunk sees and not on when. Feeding each chunk its inputs as they are computed records
++    the same ranges from the same steps, with nothing written down.
++
++    A prompt longer than the prompt graph goes through in blocks of max_num_token at advancing
++    positions, the way the runtime feeds it, and every block is observed. That is what lets a
++    sample fill the window, so the observers see the positions and cache contents of a long
++    context rather than a sixty-token prompt over an empty cache. The replies after it follow
++    MediaTek's loop step for step.
++    """
++    for input_ids in tqdm(samples, desc="Calibrating Model: "):
++        if len(input_ids) + response_cap >= max_cache_size:
++            raise ValueError(
++                f"a {len(input_ids)}-token sample and {response_cap} replies do not fit "
++                f"a {max_cache_size}-token cache"
++            )
++        cache = reset_cache(
++            len(models), num_key_value_heads, num_blocks_per_chunk, head_dim, max_cache_size
 +        )
-+        next_token_logits = logits[:, -1, :]
-+        next_token = torch.argmax(next_token_logits, dim=-1)
++        seq_length = 0
++        for start in range(0, len(input_ids), max_num_token):
++            block = torch.tensor([input_ids[start : start + max_num_token]], dtype=torch.int32)
++            hidden_state = embedding_layer(block)
++            input_length = hidden_state.shape[1]
++            mask = generate_mask(max_cache_size, seq_length, input_length, input_length)
++            pos_emb = master_rot_emb[:, :, seq_length : seq_length + input_length, :]
++            logits, cache = run_step(
++                models, prepared, hidden_state, cache, mask, pos_emb, num_blocks_per_chunk
++            )
++            seq_length += input_length
++        next_token = torch.argmax(logits[:, -1, :], dim=-1)
++        response_count = 0
++        while True:
++            curr_input_id = next_token[:, None].to(torch.int32)
++            input_length = curr_input_id.shape[1]
++            hidden_state = embedding_layer(curr_input_id)
++            mask = generate_mask(max_cache_size, seq_length, input_length, input_length)
++            pos_emb = master_rot_emb[:, :, seq_length : seq_length + input_length, :]
++            logits, cache = run_step(
++                models, prepared, hidden_state, cache, mask, pos_emb, num_blocks_per_chunk
++            )
++            next_token = torch.argmax(logits[:, -1, :], dim=-1)
++            if next_token == eos_token_id_tensor:
++                print(f"Found EOS on batch: {response_count}")
++                break
++            response_count += 1
++            seq_length += input_length
++            if response_count == response_cap:
++                break
 +
-+        if next_token == eos_token_id_tensor:
-+            print(f"Found EOS on batch: {response_count}")
-+            break
 +
-+        response_count += 1
-+        seq_length += input_length
-+        if response_count == response_cap:
-+            break
-+
-+    return model_input_dict
-+
-+
-+def calibrate_model(model, cal_dataset, chunk_idx: str):
-+    with torch.no_grad():
-+        for inp in tqdm(cal_dataset, desc="Calibrating Model: "):
-+            for batch in tqdm(inp[chunk_idx].keys(), desc="Batch: "):
-+                if inp[chunk_idx][batch] is not None:
-+                    inputs_embeds = torch.tensor(inp[chunk_idx][batch]["hidden_state"])
-+                    mask = torch.tensor(inp[chunk_idx][batch]["mask"])
-+                    pos_emb = torch.tensor(inp[chunk_idx][batch]["pos_emb"])
-+                    cache = torch.tensor(inp[chunk_idx][batch]["cache"])
-+                    model(inputs_embeds, mask, pos_emb, *torch.split(cache, 1, dim=0))
-+
-+
-+def export_to_et_ir(
-+    output_folder,
-+    exp_name,
-+    model,
-+    precision,
-+    max_num_token,
-+    max_cache_size,
-+    chunk_idx,
-+    export_shapes,
-+    platform_b,
-+    cal_dataset=None,
-+):
-+    print(f"Exporting Chunk {chunk_idx} to PTE")
++def prepare_chunk(model, precision, max_num_token, max_cache_size):
 +    example_inputs, dynamic_shapes = model.get_example_inputs(
 +        max_num_token, max_cache_size, True
 +    )
@@ -404,11 +360,19 @@ index 0000000..c6a7e7d
 +    ).module()
 +    quantizer = NeuropilotQuantizer()
 +    quantizer.setup_precision(getattr(Precision, precision))
-+    prepared_graph = prepare_pt2e(pre_autograd_aten_dialect, quantizer)
-+    if cal_dataset is not None:
-+        calibrate_model(prepared_graph, cal_dataset, str(chunk_idx))
-+    else:
-+        prepared_graph(*example_inputs)
++    return prepare_pt2e(pre_autograd_aten_dialect, quantizer), example_inputs
++
++
++def lower_chunk(
++    output_folder,
++    exp_name,
++    model,
++    prepared_graph,
++    chunk_idx,
++    export_shapes,
++    platform_b,
++):
++    print(f"Exporting Chunk {chunk_idx} to PTE")
 +    converted_graph = convert_pt2e(prepared_graph, fold_quantize=False)
 +
 +    method_to_edge_program = {}
@@ -546,54 +510,54 @@ index 0000000..c6a7e7d
 +        chunk = chunk.load_weights(state_dict, sum(num_blocks_per_chunk[:chunk_idx]))
 +        models.append(chunk)
 +
-+    cal_dataset = None
++    samples = None
 +    if args.dataset is not None:
-+        cal_dataset = load_dataset("text", data_files=args.dataset, split="train")
 +        master_rot_emb = get_master_rot_emb(config, dtype=torch.float32)
-+        if args.preformatter is not None:
-+            cal_dataset = cal_dataset.map(
-+                apply_preformatter, fn_kwargs={"preformatter": preformatter}
-+            )
-+        cal_dataset = cal_dataset.map(
-+            tokenize_dataset, fn_kwargs={"tokenizer": tokenizer}
++        samples = load_samples(
++            args.dataset,
++            tokenizer,
++            preformatter if args.preformatter is not None else None,
 +        )
-+        print("Preparing Model Calibration Inputs...")
-+        cal_dataset = cal_dataset.map(
-+            prepare_model_inputs,
-+            fn_kwargs={
-+                "models": models,
-+                "embedding_layer": embedding_layer,
-+                "master_rot_emb": master_rot_emb,
-+                "num_blocks_per_chunk": num_blocks_per_chunk,
-+                "num_key_value_heads": config.num_key_value_heads,
-+                "head_dim": head_dim,
-+                "max_cache_size": max_cache_size,
-+                "eos_token_id_tensor": torch.tensor(tokenizer.eos_token_id),
-+                "response_cap": args.response_cap,
-+            },
-+            # One prepared prompt in memory at a time. Every step of a prompt keeps a full
-+            # fp32 cache at the whole window, and the default writer_batch_size of 1000
-+            # holds every prompt's steps before any of them reach Arrow: at a 32k window
-+            # that is nine prompts times ten steps times 2.1 GB, which no runner has. The
-+            # steps produced, their order and their values are identical either way; only
-+            # the number resident at once changes, and the peak drops by the prompt count.
-+            writer_batch_size=1,
++
++    # Every chunk's observers exist before any sample runs, so one pass calibrates them all.
++    prepared = []
++    for chunk_idx, chunk in enumerate(models):
++        print(f"Preparing Chunk {chunk_idx} for calibration")
++        prepared.append(prepare_chunk(chunk, args.precision, max_num_token, max_cache_size))
++
++    if samples is not None:
++        print(f"Calibrating {len(samples)} samples through {len(models)} chunks...")
++        calibrate_streaming(
++            samples,
++            models,
++            [graph for graph, _ in prepared],
++            embedding_layer,
++            master_rot_emb,
++            num_blocks_per_chunk,
++            config.num_key_value_heads,
++            head_dim,
++            max_cache_size,
++            max_num_token,
++            torch.tensor(tokenizer.eos_token_id),
++            args.response_cap,
 +        )
-+        cal_dataset = cal_dataset.with_format("numpy")
++    else:
++        for graph, example_inputs in prepared:
++            graph(*example_inputs)
 +
 +    for chunk_idx, chunk in enumerate(models):
-+        export_to_et_ir(
++        graph, _ = prepared[chunk_idx]
++        prepared[chunk_idx] = None
++        lower_chunk(
 +            output_folder,
 +            exp_name,
 +            chunk,
-+            args.precision,
-+            max_num_token,
-+            max_cache_size,
++            graph,
 +            chunk_idx,
 +            export_shapes,
 +            platform_b,
-+            cal_dataset,
 +        )
++        del graph
 +
 +
 +if __name__ == "__main__":

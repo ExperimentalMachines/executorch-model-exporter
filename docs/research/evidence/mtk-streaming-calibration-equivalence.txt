@@ -1,0 +1,17 @@
+LFM2.5-1.2B-Instruct @ 0f604ada3f76, 4 chunks, A16W4, ExecuTorch examples/mediatek at 3dd7ccd1 with
+both patches, torch 2.13.0, torchao 0.18.0, executorch 1.4.0, transformers 4.57.6, datasets 3.6.0,
+macOS arm64 (MediaTek's compiler stubbed: calibration never calls it). 2026-09-23.
+
+1. Same samples, old code against new code (alpaca.txt, 9 prompts, qwen3.json, 512 window):
+   old (Arrow round trip, per-chunk passes): 524 observers in 214 s
+   new (one streaming pass, nothing kept):   524 observers in 78 s
+   identical ranges: 524, differing: 0, largest difference: 0.0
+
+2. Same code, alpaca.txt against the long-context corpus (pipeline/mtk_corpus.py, 7 conversations
+   and 7 passages filling 383 to 2,038 tokens, plus the 9 alpaca prompts), 2,048 window:
+   alpaca: 87 s; long-context: 390 s
+   live activation observers: 391; wider with long context: 327; narrower: 12
+   span ratio long/alpaca: median 1.09, p90 1.54, max 3.25
+   observers where alpaca's range misses >10% / >25% / >50% of the long-context range: 180 / 75 / 5
+   (the long-context run in 2 used the 14 long samples alone; the 12 narrower ranges are why
+   the shipped corpus keeps alpaca's 9 prompts as its short samples)
