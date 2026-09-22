@@ -118,4 +118,3 @@ def test_measuring_gate_records_throughput_and_passes():
     assert result["decode_tok_per_sec"] == 42.12
     assert result["prompt_tokens"] == 16
     assert result["generated_tokens"] == 32
-

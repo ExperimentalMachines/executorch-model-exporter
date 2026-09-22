@@ -228,4 +228,3 @@ def measuring_gate(stats: dict | None = None) -> dict:
         "prompt_tokens": int(prompt_tok) if prompt_tok is not None else None,
         "generated_tokens": int(gen_tok) if gen_tok is not None else None,
     }
-
