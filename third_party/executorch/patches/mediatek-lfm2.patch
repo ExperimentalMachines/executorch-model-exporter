@@ -60,7 +60,7 @@ new file mode 100644
 index 0000000..c6a7e7d
 --- /dev/null
 +++ b/examples/mediatek/model_export_scripts/lfm2.py
-@@ -0,0 +1,530 @@
+@@ -0,0 +1,537 @@
 +# Copyright (c) MediaTek Inc.
 +# All rights reserved
 +#
@@ -571,6 +571,13 @@ index 0000000..c6a7e7d
 +                "eos_token_id_tensor": torch.tensor(tokenizer.eos_token_id),
 +                "response_cap": args.response_cap,
 +            },
++            # One prepared prompt in memory at a time. Every step of a prompt keeps a full
++            # fp32 cache at the whole window, and the default writer_batch_size of 1000
++            # holds every prompt's steps before any of them reach Arrow: at a 32k window
++            # that is nine prompts times ten steps times 2.1 GB, which no runner has. The
++            # steps produced, their order and their values are identical either way; only
++            # the number resident at once changes, and the peak drops by the prompt count.
++            writer_batch_size=1,
 +        )
 +        cal_dataset = cal_dataset.with_format("numpy")
 +

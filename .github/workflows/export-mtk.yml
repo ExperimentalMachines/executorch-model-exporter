@@ -93,7 +93,13 @@ jobs:
         context: ${{ fromJSON(needs.targets.outputs.contexts) }}
     # Stays on x86: mtk_converter 8.13.0 is a cp310 x86 build and the NeuroPilot SDK
     # ships x86_64 libraries (finding 14).
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    #
+    # 32 vCPU for the memory, not the cores. Calibration holds a full fp32 cache per prompt
+    # and step at the full window (export_mtk.calibration_bytes), so the window the runner
+    # can reach is set by its RAM: the 8 vCPU runner's 32 GB plus swap tops out around a
+    # 2048 window, where 128 GB reaches 8192. The cores are welcome too, since roughly
+    # three quarters of an export parallelises, but they are not why this is here.
+    runs-on: blacksmith-32vcpu-ubuntu-2404
     timeout-minutes: 350
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -109,7 +115,11 @@ jobs:
       # The pipeline itself (fetch, reports, publishing) on the repo's usual Python.
       - uses: ./.github/actions/setup-export
         with:
-          swap-gib: "24"
+          # One prompt's calibration steps at a 32k window is about 150 GiB for the 2.6B
+          # (export_mtk.calibration_bytes), which is over the runner's 128 GB of RAM. Swap
+          # carries the difference: the tensors are written once and read back by the
+          # memory-mapped Arrow file, so paging costs time rather than correctness.
+          swap-gib: "64"
           requirements: requirements/export-mtk.txt
 
       - name: Name things

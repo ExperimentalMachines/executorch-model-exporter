@@ -175,17 +175,36 @@ def test_calibration_memory_estimate_covers_the_measured_peak_and_refuses_what_d
     config = hf_config("Qwen/Qwen3-0.6B")
     params = TOTAL_PARAMS["Qwen/Qwen3-0.6B"]
     weights = 751_632_384 * 6
+
+    # The peak is one prompt's steps, not the corpus. This is the property the
+    # writer_batch_size=1 in the MediaTek patches buys, and the reason a bigger calibration
+    # set is now free: nine prompts cost what one does.
     at_512 = export_mtk.calibration_bytes(config, CFG.mtk, 9, params)
-    assert at_512 == int(9 * 10 * 229_376 * 512 * 2.4) + weights == 29_876_944_896
-    # Run 34760462220 peaked at 29,592,731,648 B of RAM + swap in use (finding 25).
-    assert at_512 >= 29_592_731_648
-    # 16.8 GB RAM + 24 GB swap minus the reserve: 512 fits with all 9 prompts; 2048 does not
-    # fit even with mtk.min_calibration_prompts (run 1 took the runner down at 2048).
-    budget = 16_765_378_560 + 25_769_799_680 - 1_000_000_000
-    at_2k = dataclasses.replace(CFG.mtk, cache_size=2048)
-    assert at_512 < budget
-    assert export_mtk.calibration_bytes(config, at_2k, CFG.mtk.min_calibration_prompts, params) == 49_606_950_912
-    assert 49_606_950_912 > budget
+    assert at_512 == export_mtk.calibration_bytes(config, CFG.mtk, 512, params)
+    assert at_512 == int(10 * 229_376 * 512 * export_mtk.CALIBRATION_OVERHEAD) + weights
+
+    # Both runs that were measured held every prompt at once, so their peaks bound the old
+    # behaviour and the new estimate has to come in well under them, or the patch did
+    # nothing. Qwen3-0.6B run 34760462220: 29,592,731,648 B. LFM2.5-1.2B 2026-09-13:
+    # 18,383,785,984 B. Nothing has yet measured the peak *with* writer_batch_size=1, which
+    # is why CALIBRATION_OVERHEAD keeps the larger of the two solved factors.
+    assert at_512 < 29_592_731_648 / 3
+
+    # LFM2.5-1.2B and 2.6B are what this matrix exports: 16 and 30 layers, 8 KV heads, head
+    # dim 64. Every window from 2k to 32k has to fit a blacksmith-32vcpu runner, 128 GB with
+    # the 64 GiB swap the workflow adds, or the window cannot be built there.
+    budget = 128_000_000_000 + 64 * 1024**3 - 1_000_000_000
+    for layers, model_params in ((16, 1_170_340_608), (30, 2_600_000_000)):
+        lfm = {
+            "num_hidden_layers": layers,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 64,
+            "hidden_size": 2048,
+        }
+        for window in (2048, 4096, 8192, 16384, 32768):
+            recipe = dataclasses.replace(CFG.mtk, cache_size=window)
+            assert export_mtk.calibration_bytes(lfm, recipe, 9, model_params) < budget
 
 
 def test_the_calibration_patch_adds_what_the_export_checks_for():

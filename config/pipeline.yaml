@@ -106,10 +106,15 @@ export:
     precision: A16W4
     max_chunks: 4
     # Static shapes: a prompt graph taking prompt_tokens per step and a one-token
-    # generation graph, both over a cache of cache_size tokens (the window). 512 is
-    # MediaTek's default: calibration keeps a full fp32 KV cache per prompt and step, so
-    # its memory grows with the window (export_mtk.calibration_bytes); at 2048 it exhausted
-    # the runner's 16.8 GB RAM + 24 GB swap and took the runner down.
+    # generation graph, both over a cache of cache_size tokens (the window).
+    #
+    # 512 is MediaTek's default and was the only window that would build: calibration held
+    # every prompt's steps at once, each with a full fp32 KV cache at the window, and 2048
+    # exhausted a 16.8 GB runner and took it down. The patched scripts pass
+    # writer_batch_size=1 so one prompt is resident instead of all nine, which takes the
+    # corpus size out of the peak and puts 2k to 32k within a blacksmith-32vcpu runner.
+    # This stays at MediaTek's default because it is the floor of the matrix; the windows
+    # actually built come from context_tiers through the workflow's contexts input.
     prompt_tokens: 128
     cache_size: 512
     # Calibration prompts shipped with examples/mediatek, wrapped in the family's chat
@@ -117,7 +122,8 @@ export:
     # generated tokens per prompt that calibrate the one-token graph (MediaTek's default 9).
     calibration: aot_utils/llm_utils/prompts/alpaca.txt
     response_cap: 9
-    # Larger windows keep fewer of the 9 prompts to fit the runner's memory (export_mtk):
-    # never fewer than this, or the window is skipped. Each export report records
-    # prompts_used, so the benchmarker can see what a window was calibrated on.
+    # Kept for the report and for older recipes: since writer_batch_size=1 the peak is one
+    # prompt's steps whatever the corpus size, so no window trims the corpus any more and a
+    # window that does not fit is skipped outright rather than calibrated on too little.
+    # Each export report still records prompts_used, so a reader can see what was used.
     min_calibration_prompts: 4

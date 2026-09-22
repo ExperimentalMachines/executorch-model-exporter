@@ -58,10 +58,19 @@ RUNNER_IO_TYPES = {
     "rot_emb_type": "fp32",
 }
 # calibration_bytes: the calibration tensors times this (their Arrow copy and the rest that
-# grows with them), plus WEIGHT_BYTES_PER_PARAM for the weights held throughout. Fitted to
-# run 34760462220 (Qwen3-0.6B, MT6989, 512, 9 prompts): 29,592,731,648 B of RAM + swap in
-# use at its peak, during "Preparing Model Calibration Inputs" (docs/research, finding 25).
-CALIBRATION_OVERHEAD = 2.4
+# grows with them), plus WEIGHT_BYTES_PER_PARAM for the weights held throughout. Solved from
+# the peak RAM + swap in use each run reported, during "Preparing Model Calibration Inputs":
+#
+#   Qwen3-0.6B, MT6989, 512, 9 prompts, run 34760462220: 29,592,731,648 B -> 2.37
+#   LFM2.5-1.2B, MT6991, 512, 9 prompts, 2026-09-13:     18,383,785,984 B -> 3.76
+#
+# The factor is not the same across families and one point was never a calibration, so this
+# takes the worse of the two and rounds up. Erring low is the expensive direction: the
+# trimming loop below only trims until the *estimate* fits, so an estimate that is 1.6x low
+# walks the export into an OOM that takes the runner down with it instead of dropping a
+# prompt. That is what happened at a 2048 window on the 16.8 GB runner, which this value
+# would now refuse up front.
+CALIBRATION_OVERHEAD = 3.8
 # model_export_scripts/qwen.py:454-480 keeps the whole checkpoint as a state_dict (16-bit as
 # published) and builds every chunk from it in fp32: 2 + 4 bytes per parameter.
 WEIGHT_BYTES_PER_PARAM = 6
@@ -120,17 +129,22 @@ def calibration_bytes(config: dict, recipe: settings.MtkRecipe, prompts: int, pa
     """Estimated peak of RAM + swap in use while MediaTek's script prepares calibration inputs,
     the export's peak (docs/research, findings 15, 23, 25).
 
-    For every prompt, model_export_scripts/*.py prepare_model_inputs keeps the fp32 KV cache
-    of every layer at the full cache size for the prompt step and each generated token (up
-    to response_cap), and datasets.map then holds them all as Arrow rows before writing,
-    while the weights stay loaded. One measured point (see CALIBRATION_OVERHEAD) fixes the
-    factor, so how the peak splits between the two terms is an assumption.
+    model_export_scripts/*.py prepare_model_inputs returns one row per prompt holding the
+    fp32 KV cache of every layer, at the full cache size, for the prompt step and each
+    generated token up to response_cap. The patched scripts pass writer_batch_size=1, so
+    datasets.map keeps **one** of those rows in memory and the finished Arrow file is
+    memory mapped, which takes the prompt count out of the peak entirely: it is one prompt's
+    steps plus the weights, whatever the corpus size. Before that it was every prompt at
+    once, which is what held the window at 512.
+
+    [prompts] no longer changes the answer and is kept so callers and the report read the
+    same way; it is asserted against rather than multiplied in.
     """
     c = families.text_config(config)
     n_heads = int(c["num_attention_heads"])
     head_dim = int(c.get("head_dim") or int(c["hidden_size"]) // n_heads)
     kv_per_token = int(c["num_hidden_layers"]) * 2 * int(c.get("num_key_value_heads") or n_heads) * head_dim * 4
-    steps = prompts * (1 + recipe.response_cap)
+    steps = 1 + recipe.response_cap
     tensors = steps * kv_per_token * recipe.cache_size
     return int(tensors * CALIBRATION_OVERHEAD) + params * WEIGHT_BYTES_PER_PARAM
 
@@ -261,26 +275,20 @@ def run(
         if problems:
             raise ExportError("; ".join(problems))
 
-    # Calibration memory grows with the window (calibration_bytes): larger windows keep
-    # fewer of MediaTek's prompts, down to mtk.min_calibration_prompts; past that the window
-    # is skipped on this host rather than calibrated on too little.
+    # Calibration memory is one prompt's steps at the full window (calibration_bytes), so
+    # the corpus size is free and every prompt is kept. What is not free is the window: a
+    # host that cannot hold one prompt's steps cannot build this window at all, and says so
+    # rather than being taken down by the OOM killer half an hour in.
     prompts_text = (examples_dir / recipe.calibration).read_text(encoding="utf-8")
     lines = [line for line in prompts_text.splitlines() if line.strip()]
     budget = host_budget(host_info())
     prompts = len(lines)
-    floor = min(recipe.min_calibration_prompts, prompts)
     params = source.total_params  # eligibility refuses a model without it
-
-    def needs(n: int) -> int:
-        return calibration_bytes(source.config, recipe, n, params)
-
-    while budget is not None and prompts > floor and needs(prompts) > budget:
-        prompts -= 1
-    needed = needs(prompts)
+    needed = calibration_bytes(source.config, recipe, prompts, params)
     if budget is not None and needed > budget:
         raise SkipExport(
-            f"calibration at a {window}-token cache needs about {needed:,} B even with {prompts} prompts "
-            f"({1 + recipe.response_cap} steps each), this host has {budget:,} B"
+            f"calibration at a {window}-token cache needs about {needed:,} B for one prompt's "
+            f"{1 + recipe.response_cap} steps, this host has {budget:,} B"
         )
     dataset = recipe.calibration
     if prompts < len(lines):
