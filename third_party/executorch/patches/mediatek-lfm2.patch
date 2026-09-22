@@ -11,10 +11,30 @@ index 84b2e3a..84219ca 100644
      if not isinstance(config, BaseConfig):
          raise RuntimeError(
 diff --git a/examples/mediatek/aot_utils/llm_utils/utils.py b/examples/mediatek/aot_utils/llm_utils/utils.py
-index 6c00bbb..7d646ef 100644
+index 6c00bbb..9d5fa24 100644
 --- a/examples/mediatek/aot_utils/llm_utils/utils.py
 +++ b/examples/mediatek/aot_utils/llm_utils/utils.py
-@@ -854,6 +854,11 @@ def resolve_model_classes(
+@@ -509,7 +509,7 @@ def get_master_rot_emb(config, dtype, **kwargs):
+     if config.ntk_scaling_factor != 1.0:
+         base = (10000 * config.ntk_scaling_factor) ** (rot_dim / (rot_dim - 2))
+     else:
+-        base = 10000
++        base = getattr(config, "rope_theta", 10000)
+ 
+     if getattr(config, "rope_scaling", None) is not None:
+         if config.rope_scaling["type"] == "longrope":
+@@ -767,6 +767,10 @@ def get_normalized_config(config_filepath):
+             from models.llm_models.configuration_gemma import (
+                 GemmaConfig as config_class,
+             )
++        elif config_file["model_type"] == "lfm2":
++            from models.llm_models.configuration_lfm2 import (
++                Lfm2Config as config_class,
++            )
+     else:
+         if config_file["llm"]["model_type"] == "whisper_decoder":
+             from models.llm_models.configuration_whisper import (
+@@ -854,6 +858,11 @@ def resolve_model_classes(
                  GemmaConfig as config_class,
              )
              from models.llm_models.modeling_gemma import Gemma3ModelChunk as chunk_class
@@ -26,7 +46,7 @@ index 6c00bbb..7d646ef 100644
      else:
          if config_file["llm"]["model_type"] == "whisper_decoder":
              from models.llm_models.configuration_whisper import (
-@@ -887,6 +892,8 @@ def resolve_model_classes(
+@@ -887,6 +896,8 @@ def resolve_model_classes(
                      from aot_utils.llm_utils.tokenizers_.tokenization_gpt2 import (
                          GPT2Tokenizer as tokenizer_class,
                      )
@@ -561,10 +581,10 @@ index 0000000..2b5a636
 +    main()
 diff --git a/examples/mediatek/models/llm_models/configuration_lfm2.py b/examples/mediatek/models/llm_models/configuration_lfm2.py
 new file mode 100644
-index 0000000..7bec8ab
+index 0000000..105f19b
 --- /dev/null
 +++ b/examples/mediatek/models/llm_models/configuration_lfm2.py
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,120 @@
 +# Copyright (c) MediaTek Inc.
 +# All rights reserved
 +#
@@ -639,6 +659,10 @@ index 0000000..7bec8ab
 +
 +        self.position_embedding = position_embedding
 +        self.max_position_embeddings = max_position_embeddings or 131072
++        self.ntk_scaling_factor = kwargs.pop("ntk_scaling_factor", 1.0) or 1.0
++        self.rope_theta = kwargs.pop("rope_theta", 1000000.0) or 1000000.0
++        self.rope_scaling = kwargs.pop("rope_scaling", None)
++        self.original_max_position_embeddings = kwargs.pop("original_max_position_embeddings", None)
 +
 +        self.use_stable_embedding = use_stable_embedding
 +        self.tie_word_embeddings = kwargs.pop("tie_embedding", tie_word_embeddings)
