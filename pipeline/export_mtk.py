@@ -48,6 +48,9 @@ BACKEND = "mtk"
 DELEGATE = b"NeuropilotBackend"
 # examples/mediatek/model_export_scripts/*.py --platform
 SOC_PLATFORMS = {"MT6989": "DX3", "MT6991": "DX4"}
+# backends/mediatek/quantizer/qconfig.py Precision. A16W8 is the one measured against A16W4:
+# KL to fp32 0.0068 against 0.75 on LFM2.5-1.2B at 4k (docs/research finding 35).
+PRECISIONS = frozenset({"A16W16", "A16W8", "A16W4", "A8W8", "A8W4"})
 SOC_NAMES = {"MT6989": "Dimensity 9300", "MT6991": "Dimensity 9400"}
 # IO types of the graphs these scripts export, as ExecuTorch's run_qwen2_sample.sh and
 # run_qwen3_sample.sh pass them to the runner.
@@ -361,6 +364,10 @@ def run(
     recipe = cfg.mtk
     if soc not in SOC_PLATFORMS:
         raise ExportError(f"unknown MediaTek chip {soc!r}; ExecuTorch 1.4.0's scripts know {sorted(SOC_PLATFORMS)}")
+    precision = os.environ.get("MTK_PRECISION") or recipe.precision
+    if precision not in PRECISIONS:
+        raise ExportError(f"unknown NeuroPilot precision {precision!r}, expected one of {sorted(PRECISIONS)}")
+    recipe = dataclasses.replace(recipe, precision=precision)
     if context is not None:
         if context < recipe.prompt_tokens:
             raise ExportError(f"--context {context} is below the prompt length {recipe.prompt_tokens}")

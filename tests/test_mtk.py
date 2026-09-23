@@ -110,6 +110,14 @@ def test_unknown_chip_and_short_window_are_refused_before_any_download(tmp_path)
         export_mtk.run("Qwen/Qwen3-0.6B", "main", "MT6991", tmp_path, tmp_path, "p", tmp_path, context=64)
 
 
+def test_the_precision_comes_from_the_environment_and_only_as_a_name_mediatek_knows(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTK_PRECISION", "A16W3")
+    with pytest.raises(export_mtk.ExportError, match="unknown NeuroPilot precision"):
+        export_mtk.run("Qwen/Qwen3-0.6B", "main", "MT6991", tmp_path, tmp_path, "p", tmp_path)
+    # And a known one names the files, so an A16W8 export sits beside an A16W4 one.
+    assert "-neuropilot-a16w8-4k-" in naming.mtk_chunk_file("Qwen/Qwen3-0.6B", "A16W8", 4096, 0, 4)
+
+
 def mtk_report(soc="mt6991"):
     chunks = [f"mtk/{soc}/Qwen3-0.6B-neuropilot-a16w4-2k-chunk{i}of4.pte" for i in range(1, 5)]
     embedding = f"mtk/{soc}/Qwen3-0.6B-neuropilot-embedding-fp32.bin"

@@ -1,5 +1,5 @@
 name: Export MediaTek
-run-name: "MediaTek: ${{ inputs.model_id }}@${{ inputs.revision }}${{ inputs.contexts && format(' ctx {0}', inputs.contexts) || '' }}"
+run-name: "MediaTek: ${{ inputs.model_id }}@${{ inputs.revision }}${{ inputs.precision && format(' {0}', inputs.precision) || '' }}${{ inputs.contexts && format(' ctx {0}', inputs.contexts) || '' }}"
 
 on:
   workflow_dispatch:
@@ -24,6 +24,10 @@ on:
         description: Maximum chunks to divide the model into (1, 2, 4); empty for mtk.max_chunks in config/pipeline.yaml
         default: ""
         type: string
+      precision:
+        description: NeuroPilot precision (A16W4, A16W8); empty for mtk.precision in config/pipeline.yaml
+        default: ""
+        type: string
       publish_hf:
         description: Publish to the Hugging Face org in config/pipeline.yaml
         default: true
@@ -37,7 +41,7 @@ permissions:
   contents: write # GitHub releases
 
 concurrency:
-  group: export-mtk-${{ inputs.model_id }}
+  group: export-mtk-${{ inputs.model_id }}-${{ inputs.precision }}
   cancel-in-progress: false
 
 jobs:
@@ -103,6 +107,7 @@ jobs:
       SOC: ${{ matrix.soc }}
       CONTEXT: ${{ matrix.entry.context }}
       MTK_MAX_CHUNKS: ${{ inputs.max_chunks }}
+      MTK_PRECISION: ${{ inputs.precision }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
