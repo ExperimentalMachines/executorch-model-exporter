@@ -14,10 +14,13 @@ exchange, and long pasted documents with a question after them. MediaTek's nine 
 as the short samples, so every range is at least what the old recipe measured. Measured on
 LFM2.5-1.2B at a 2k window: the long samples alone widened 327 of 391 live ranges (median 1.09x,
 up to 3.25x), alpaca's range missed over a quarter of the long-context range in 75 of them, and
-12 were wider under alpaca, which is why it stays. Every sample is rendered in the model's own
-chat template, which is also what gives it exactly one BOS: the old recipe wrapped alpaca in
-Qwen3's template, which has none, so a model whose tokenizer does not add BOS by itself
-(LFM2.5-2.6B) was calibrated without one.
+12 were wider under alpaca, which is why it stays. What that is worth on the output is small:
+at 4k, KL to fp32 went from 0.751 to 0.745 on held-out text, because the 4-bit weights are the
+error (A16W8 on the same text: 0.0068; docs/research finding 35).
+
+Every sample is rendered in the model's own chat template, which is also what gives it exactly
+one BOS: the old recipe wrapped alpaca in Qwen3's template, which has none, so a model whose
+tokenizer does not add BOS by itself (LFM2.5-2.6B) was calibrated without one.
 
 The sources are pinned by revision and sha256, so a run is repeatable:
 
