@@ -165,9 +165,7 @@ def readme(repo_id: str, reports: list[dict], hub_tags: list[str], license_files
         "",
         "## Files",
         "",
-        "Every backend is exported at every context window the runner could build (2k to 32k"
-        + (", plus MediaTek's default 512" if any(r["backend"] == "mtk" for r in reports) else "")
-        + "). "
+        f"Windows in this repo: {window_spans(reports)}. "
         "The window is fixed inside the file: the runtime allocates the whole KV cache at load, "
         "so pick the largest window the device can hold (`fits_phone_budget` in each folder's "
         "`config.json` is the estimate against a 5 GB budget).",
@@ -271,7 +269,34 @@ def readme(repo_id: str, reports: list[dict], hub_tags: list[str], license_files
             "(`examples/mediatek/executor_runner`) with the device's NeuroPilot runtime; the settings it "
             "needs are in each folder's `config.json`, under each variant's `runner`.",
         ]
+        if any(r["runner"].get("state_layout") == "per-layer" for r in mtk):
+            # MediaTek's stock runner counts 2 * num_layer / num_chunk caches per chunk and
+            # refuses these files at load, so the card has to say which runner reads them.
+            out += [
+                "",
+                "Variants whose `runner` says `state_layout: per-layer` give each short-convolution layer "
+                "its own two-position state, and take two small inputs that keep the runner's padding out "
+                "of the convolution. MediaTek's runner as ExecuTorch 1.4.0 ships it cannot load them; the "
+                "one that can is ExecuTorch's `examples/mediatek/executor_runner/llama_runner` with "
+                "[OpenWeights' patch](https://github.com/ExperimentalMachines/openweights/blob/main/tools/npu/"
+                "patches/executorch-release-1.4-pd.patch), which tells caches from states by shape.",
+            ]
     return "\n".join(out) + "\n"
+
+
+def window_spans(reports: list[dict]) -> str:
+    """Each backend and chip with the smallest and largest window published for it, read from
+    the reports: a fixed sentence claimed 2k to 32k everywhere, which a MediaTek folder that
+    stops at 8k (a 16k does not fit a 12 GB phone's NPU memory) contradicts."""
+    windows: dict[str, list[int]] = {}
+    for r in reports:
+        name = BACKEND_TITLES[r["backend"]] + (f" {target(r)}" if r.get("target") else "")
+        windows.setdefault(name, []).append(r["window"]["context"])
+    spans = []
+    for name, sizes in windows.items():
+        low, high = naming.window_label(min(sizes)), naming.window_label(max(sizes))
+        spans.append(f"{name} at {low}" if low == high else f"{name} at {low} to {high}")
+    return "; ".join(spans)
 
 
 def target(report: dict) -> str:

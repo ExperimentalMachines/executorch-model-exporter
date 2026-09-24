@@ -178,6 +178,24 @@ def test_readme_credits_mediatek_without_claiming_the_sdk_is_included():
     assert "- mtk" in text
 
 
+def test_the_card_states_each_backends_windows_from_its_reports():
+    small, large = mtk_report(), mtk_report()
+    small["window"] = {**small["window"], "context": 512}
+    large["window"] = {**large["window"], "context": 8192}
+    assert manifest.window_spans([small, large]) == "MediaTek NeuroPilot MT6991 (Dimensity 9400) at 512 to 8k"
+    assert manifest.window_spans([small]) == "MediaTek NeuroPilot MT6991 (Dimensity 9400) at 512"
+
+
+def test_the_card_names_the_runner_a_per_layer_build_needs_and_only_then():
+    uniform = manifest.readme("experimentalmachines/Qwen3-0.6B-ExecuTorch", [mtk_report()], [], [])
+    assert "state_layout: per-layer" not in uniform
+    lfm = mtk_report()
+    lfm["runner"] = {**lfm["runner"], "state_layout": "per-layer"}
+    text = manifest.readme("experimentalmachines/LFM2.5-1.2B-Instruct-ExecuTorch", [lfm, mtk_report()], [], [])
+    assert "`state_layout: per-layer`" in text and "cannot load them" in text
+    assert "tools/npu/patches/executorch-release-1.4-pd.patch" in text
+
+
 def test_publish_refuses_a_tokenizer_inside_a_mediatek_folder(tmp_path):
     folder = tmp_path / "mtk" / "mt6991"
     folder.mkdir(parents=True)
