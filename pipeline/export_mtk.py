@@ -97,6 +97,20 @@ PATCH_MARKER = 'cal_dataset = cal_dataset.with_format("numpy")'
 # the Arrow round trip and the arrays patch do not apply to it.
 STREAMING_MARKER = "def calibrate_streaming("
 STREAMING_SCRIPTS = frozenset({"lfm2.py"})
+# The same patch gives each LFM2 conv layer its own two-position state instead of a
+# window-sized K and V it carried only to hide that state in (62% of the cache on the 1.2B),
+# plus two padding inputs that keep the runner's pads out of the conv (docs/research, finding
+# 36). States go in layer order, one per conv layer, a K and a V per attention layer. MediaTek's
+# stock runner cannot load that; the one in the openweights app tells caches from states by
+# shape. The runner block records which layout a file has, so a host can tell before loading.
+PER_LAYER_STATE_MARKER = "def state_shapes("
+PER_LAYER_STATE_SCRIPTS = frozenset({"lfm2.py"})
+
+
+def state_layout(script: str) -> str:
+    return "per-layer" if script in PER_LAYER_STATE_SCRIPTS else "uniform"
+
+
 # What streaming calibration holds: the checkpoint (2 bytes per parameter), the fp32 chunks (4)
 # and every chunk's prepared graph (4); per step the whole cache a few times over (the input,
 # the chunks' outputs, their concatenation and its clone) and one block's attention scores.
@@ -390,6 +404,8 @@ def run(
         raise ExportError(
             f"{script} lacks the streaming calibration in third_party/executorch/patches/mediatek-lfm2.patch"
         )
+    if plan.script in PER_LAYER_STATE_SCRIPTS and PER_LAYER_STATE_MARKER not in script.read_text(encoding="utf-8"):
+        raise ExportError(f"{script} lacks the per-layer states in third_party/executorch/patches/mediatek-lfm2.patch")
     if not streaming and PATCH_MARKER not in script.read_text(encoding="utf-8"):
         raise ExportError(f"{script} lacks third_party/executorch/patches/mediatek-calibration-as-arrays.patch")
 
@@ -509,6 +525,7 @@ def run(
     check = structural_check(tool_python, chunks, exp, recipe)
     runner = {
         **runner_settings(source.config, recipe, bos, eos),
+        "state_layout": state_layout(plan.script),
         "tokenizer_path": tokenizer,
         "token_embedding_path": embedding_name,
         "model_package_paths": chunk_names,

@@ -356,6 +356,23 @@ def test_the_lfm2_patch_carries_the_streaming_calibration_the_export_checks_for(
     assert plan().script not in export_mtk.STREAMING_SCRIPTS
 
 
+def test_lfm2_conv_layers_carry_their_own_state_and_the_padding_inputs():
+    patch = settings.ROOT / "third_party/executorch/patches/mediatek-lfm2.patch"
+    text = patch.read_text(encoding="utf-8")
+    modeling = text[text.index("modeling_lfm2.py b/") :]
+    added = [line[1:] for line in modeling.splitlines() if line.startswith("+")]
+    script = text[text.index("model_export_scripts/lfm2.py b/") : text.index("configuration_lfm2.py b/")]
+    assert export_mtk.PER_LAYER_STATE_MARKER in modeling
+    assert "from models.llm_models.modeling_lfm2 import conv_inputs" in script
+    # The export checks for the marker; the conv layer takes its own state, the valid mask and
+    # the selector, and no longer rides a K cache.
+    assert any("def forward(self, hidden_states, conv_valid, conv_select, conv_state):" in line for line in added)
+    assert not any("past_key[:, :, :8, :]" in line for line in added)
+    assert export_mtk.state_layout("lfm2.py") == "per-layer"
+    # Qwen keeps MediaTek's uniform caches, which the stock runner reads.
+    assert export_mtk.state_layout(plan().script) == "uniform"
+
+
 def test_a_rendered_corpus_is_passed_without_mediateks_preformatter(tmp_path):
     corpus = str(tmp_path / "calibration-4096.jsonl")
     command = export_mtk.export_command("p", plan(), CFG.mtk, "MT6991", tmp_path, corpus)

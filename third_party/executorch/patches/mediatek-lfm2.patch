@@ -57,10 +57,10 @@ index 6c00bbb..9d5fa24 100644
                      from aot_utils.llm_utils.tokenizers_.tokenization_whisper import (
 diff --git a/examples/mediatek/model_export_scripts/lfm2.py b/examples/mediatek/model_export_scripts/lfm2.py
 new file mode 100644
-index 0000000..c34c6ba
+index 0000000..6c519f7
 --- /dev/null
 +++ b/examples/mediatek/model_export_scripts/lfm2.py
-@@ -0,0 +1,501 @@
+@@ -0,0 +1,479 @@
 +# Copyright (c) MediaTek Inc.
 +# All rights reserved
 +#
@@ -106,6 +106,7 @@ index 0000000..c34c6ba
 +    resolve_model_classes,
 +)
 +from datasets import load_dataset
++from models.llm_models.modeling_lfm2 import conv_inputs
 +from executorch import exir
 +from executorch.backends.mediatek import (
 +    NeuropilotPartitioner,
@@ -247,36 +248,23 @@ index 0000000..c34c6ba
 +    return samples
 +
 +
-+def reset_cache(
-+    num_chunks, num_key_value_heads, num_blocks_per_chunk, head_dim, max_cache_size
-+):
-+    cache = []
-+    for i in range(num_chunks):
-+        curr_chunk_cache = torch.zeros(
-+            (
-+                2 * num_blocks_per_chunk[i],
-+                num_key_value_heads,
-+                max_cache_size,
-+                head_dim,
-+            ),
-+            dtype=torch.float32,
-+        )
-+        cache.append(curr_chunk_cache)
-+    return cache
++def reset_cache(models, max_cache_size):
++    """Zeroed state per chunk, in the order its forward takes them (Lfm2ModelChunk.state_shapes)."""
++    return [
++        [torch.zeros(shape, dtype=torch.float32) for shape in model.state_shapes(max_cache_size)]
++        for model in models
++    ]
 +
 +
-+def run_step(models, prepared, hidden_state, cache, mask, pos_emb, num_blocks_per_chunk):
++def run_step(models, prepared, hidden_state, cache, mask, pos_emb, conv):
 +    """One step through every chunk. Each chunk's observers see its inputs, then the fp32 chunk
-+    computes the hidden state and the cache that the next chunk and the next step read."""
++    computes the hidden state and the states that the next chunk and the next step read."""
 +    with torch.no_grad():
 +        for chunk_idx, model in enumerate(models):
-+            cache_in = torch.split(cache[chunk_idx], 1, dim=0)
-+            prepared[chunk_idx](hidden_state, mask, pos_emb, *cache_in)
-+            model_out = model(hidden_state, mask, pos_emb, *cache_in)
++            prepared[chunk_idx](hidden_state, mask, pos_emb, *conv, *cache[chunk_idx])
++            model_out = model(hidden_state, mask, pos_emb, *conv, *cache[chunk_idx])
 +            hidden_state = model_out[0]
-+            cache[chunk_idx] = torch.cat(
-+                model_out[1 : 1 + 2 * num_blocks_per_chunk[chunk_idx]], dim=0
-+            ).clone()
++            cache[chunk_idx] = [state.clone() for state in model_out[1:]]
 +    return hidden_state, cache
 +
 +
@@ -286,13 +274,11 @@ index 0000000..c34c6ba
 +    prepared,
 +    embedding_layer,
 +    master_rot_emb,
-+    num_blocks_per_chunk,
-+    num_key_value_heads,
-+    head_dim,
 +    max_cache_size,
 +    max_num_token,
 +    eos_token_id_tensor,
 +    response_cap,
++    state_rows,
 +):
 +    """Calibrate every chunk in one pass, keeping no step.
 +
@@ -315,9 +301,7 @@ index 0000000..c34c6ba
 +                f"a {len(input_ids)}-token sample and {response_cap} replies do not fit "
 +                f"a {max_cache_size}-token cache"
 +            )
-+        cache = reset_cache(
-+            len(models), num_key_value_heads, num_blocks_per_chunk, head_dim, max_cache_size
-+        )
++        cache = reset_cache(models, max_cache_size)
 +        seq_length = 0
 +        for start in range(0, len(input_ids), max_num_token):
 +            block = torch.tensor([input_ids[start : start + max_num_token]], dtype=torch.int32)
@@ -325,9 +309,8 @@ index 0000000..c34c6ba
 +            input_length = hidden_state.shape[1]
 +            mask = generate_mask(max_cache_size, seq_length, input_length, input_length)
 +            pos_emb = master_rot_emb[:, :, seq_length : seq_length + input_length, :]
-+            logits, cache = run_step(
-+                models, prepared, hidden_state, cache, mask, pos_emb, num_blocks_per_chunk
-+            )
++            conv = conv_inputs(input_length, 0, 0, state_rows)
++            logits, cache = run_step(models, prepared, hidden_state, cache, mask, pos_emb, conv)
 +            seq_length += input_length
 +        next_token = torch.argmax(logits[:, -1, :], dim=-1)
 +        response_count = 0
@@ -337,9 +320,8 @@ index 0000000..c34c6ba
 +            hidden_state = embedding_layer(curr_input_id)
 +            mask = generate_mask(max_cache_size, seq_length, input_length, input_length)
 +            pos_emb = master_rot_emb[:, :, seq_length : seq_length + input_length, :]
-+            logits, cache = run_step(
-+                models, prepared, hidden_state, cache, mask, pos_emb, num_blocks_per_chunk
-+            )
++            conv = conv_inputs(input_length, 0, 0, state_rows)
++            logits, cache = run_step(models, prepared, hidden_state, cache, mask, pos_emb, conv)
 +            next_token = torch.argmax(logits[:, -1, :], dim=-1)
 +            if next_token == eos_token_id_tensor:
 +                print(f"Found EOS on batch: {response_count}")
@@ -473,8 +455,6 @@ index 0000000..c34c6ba
 +    if args.preformatter is not None:
 +        preformatter = Preformatter(args.preformatter)
 +
-+    head_dim = int(config.head_dim)
-+
 +    num_blocks_per_chunk = [
 +        (config.num_hidden_layers // args.num_chunks)
 +        + (i < (config.num_hidden_layers % args.num_chunks))
@@ -533,13 +513,11 @@ index 0000000..c34c6ba
 +            [graph for graph, _ in prepared],
 +            embedding_layer,
 +            master_rot_emb,
-+            num_blocks_per_chunk,
-+            config.num_key_value_heads,
-+            head_dim,
 +            max_cache_size,
 +            max_num_token,
 +            torch.tensor(tokenizer.eos_token_id),
 +            args.response_cap,
++            config.conv_L_cache - 1,
 +        )
 +    else:
 +        for graph, example_inputs in prepared:
@@ -696,10 +674,10 @@ index 0000000..53074a1
 +            print()
 diff --git a/examples/mediatek/models/llm_models/modeling_lfm2.py b/examples/mediatek/models/llm_models/modeling_lfm2.py
 new file mode 100644
-index 0000000..902f255
+index 0000000..7f66c87
 --- /dev/null
 +++ b/examples/mediatek/models/llm_models/modeling_lfm2.py
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,464 @@
 +# Copyright (c) MediaTek Inc.
 +# All rights reserved
 +#
@@ -783,7 +761,18 @@ index 0000000..902f255
 +        self.post_attention_norm = RMSNorm(config.hidden_size, eps=config.norm_eps).float()
 +        self.mlp = MLP(config)
 +
-+    def forward(self, hidden_states, mask, pos_emb, past_key, past_value):
++    def forward(self, hidden_states, conv_valid, conv_select, conv_state):
++        """conv_state is the layer's own (1, dim, L_cache - 1) state, the shape the CPU export
++        keeps too. It used to ride in the first rows of a full-window K cache, with a V cache
++        passed through untouched, so every conv layer read and wrote two window-sized tensors
++        per call to carry two positions.
++
++        conv_valid (1, t, 1) is 1 on real tokens and 0 on padding, and conv_select (1, t + L - 1,
++        L - 1) picks the last L - 1 real positions of the state-padded sequence. The runner pads
++        a batch that is not full (left on a fresh cache, right after that). Attention masks the
++        pads; a causal conv does not, so without these the first real tokens mixed in the pads'
++        values and a right-padded batch handed the next one a state made of pads.
++        """
 +        residual = hidden_states
 +        if self.jit_trace:
 +            normed = self.input_norm(hidden_states)
@@ -795,13 +784,10 @@ index 0000000..902f255
 +        B = self.B_proj(normed).transpose(-1, -2)
 +        C = self.C_proj(normed).transpose(-1, -2)
 +        X = self.x_proj(normed).transpose(-1, -2)
-+        Bx = B * X
++        Bx = B * X * conv_valid.transpose(-1, -2)
 +
-+        # conv_state is carried in past_key's first 8 rows
-+        # shape: (1, num_kv_heads, 8, head_dim) -> (1, 8*8*64) -> (1, dim, L_cache - 1)
-+        state = past_key[:, :, :8, :].reshape(1, self.dim, self.L_cache - 1)
-+        Bx_padded = torch.cat([state, Bx], dim=-1)
-+        new_state = Bx_padded[:, :, -(self.L_cache - 1):]
++        Bx_padded = torch.cat([conv_state, Bx], dim=-1)
++        new_state = torch.matmul(Bx_padded, conv_select)
 +        conv_out = self.conv(Bx_padded)[:, :, :q_len]
 +        y = (C * conv_out).transpose(-1, -2).contiguous()
 +        conv_out = self.out_proj(y)
@@ -816,12 +802,7 @@ index 0000000..902f255
 +        mlp_out = self.mlp(normed)
 +        hidden_states = residual + mlp_out
 +
-+        next_key = torch.cat(
-+            [new_state.reshape(1, self.num_kv_heads, 8, self.head_dim), past_key[:, :, 8:, :]],
-+            dim=2,
-+        )
-+        next_value = past_value
-+        return hidden_states, next_key, next_value
++        return hidden_states, new_state
 +
 +
 +class Lfm2ModelChunk(BaseModelChunk):
@@ -843,10 +824,11 @@ index 0000000..902f255
 +        )
 +
 +        start_layer_idx = chunk_idx * num_blocks
++        self.layer_types = [
++            self.config.layer_types[start_layer_idx + i] for i in range(num_blocks)
++        ]
 +        self.layers = nn.ModuleList()
-+        for i in range(num_blocks):
-+            global_idx = start_layer_idx + i
-+            layer_type = self.config.layer_types[global_idx]
++        for layer_type in self.layer_types:
 +            if layer_type == "conv":
 +                self.layers.append(Lfm2ShortConvLayer(config, jit_trace=jit_trace))
 +            else:
@@ -856,30 +838,46 @@ index 0000000..902f255
 +            self.norm = RMSNorm(config.hidden_size, eps=config.norm_eps).float()
 +            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
 +
-+    def forward(self, inputs_embeds, mask, pos_emb, *cache):
-+        if not self.jit_trace:
-+            assert (
-+                len(cache) == 2 * self.num_blocks
-+            ), f"split cache wrong number of input caches: {len(cache)} != 2*{self.num_blocks}"
-+            assert (
-+                cache[0].shape[0] == inputs_embeds.size()[0]
-+            ), f"split cache batch size mismatch: {cache[0].shape[0]} != {inputs_embeds.size()[0]}"
++    def state_shapes(self, cache_size):
++        """The chunk's state tensors in the order forward takes and returns them: per layer, in
++        layer order, one (1, dim, L - 1) conv state or a K and a V cache of cache_size positions.
++        MediaTek's runner tells them apart by shape: only a cache has cache_size on axis 2."""
++        shapes = []
++        for layer_type in self.layer_types:
++            if layer_type == "conv":
++                shapes.append((1, self.config.hidden_size, self.config.conv_L_cache - 1))
++            else:
++                kv = (1, self.config.num_key_value_heads, cache_size, int(self.head_dim))
++                shapes += [kv, kv]
++        return shapes
 +
++    def forward(self, inputs_embeds, mask, pos_emb, conv_valid, conv_select, *cache):
 +        hidden_states = inputs_embeds
-+        next_key_cache = []
-+        next_value_cache = []
-+
++        next_states = []
++        cursor = 0
 +        for idx, layer in enumerate(self.layers):
 +            layer_device = self.device_list[idx] if self.device_list else hidden_states.device
-+            hidden_states, next_k, next_v = layer(
-+                hidden_states.to(layer_device),
-+                mask=mask.to(layer_device),
-+                pos_emb=pos_emb.to(layer_device),
-+                past_key=cache[idx].to(layer_device),
-+                past_value=cache[self.num_blocks + idx].to(layer_device),
-+            )
-+            next_key_cache.append(next_k.to(inputs_embeds.device))
-+            next_value_cache.append(next_v.to(inputs_embeds.device))
++            if self.layer_types[idx] == "conv":
++                hidden_states, state = layer(
++                    hidden_states.to(layer_device),
++                    conv_valid=conv_valid.to(layer_device),
++                    conv_select=conv_select.to(layer_device),
++                    conv_state=cache[cursor].to(layer_device),
++                )
++                next_states.append(state.to(inputs_embeds.device))
++                cursor += 1
++            else:
++                hidden_states, next_k, next_v = layer(
++                    hidden_states.to(layer_device),
++                    mask=mask.to(layer_device),
++                    pos_emb=pos_emb.to(layer_device),
++                    past_key=cache[cursor].to(layer_device),
++                    past_value=cache[cursor + 1].to(layer_device),
++                )
++                next_states += [next_k.to(inputs_embeds.device), next_v.to(inputs_embeds.device)]
++                cursor += 2
++        if not self.jit_trace:
++            assert cursor == len(cache), f"{len(cache)} state inputs for {cursor} states"
 +
 +        if self.include_tail:
 +            tail_device = self.device_list[-1] if self.device_list else hidden_states.device
@@ -889,7 +887,7 @@ index 0000000..902f255
 +                hidden_states = self.norm(hidden_states.to(tail_device).to(torch.float32)).to(self.dtype)
 +            hidden_states = self.lm_head(hidden_states)
 +
-+        return hidden_states, *next_key_cache, *next_value_cache
++        return hidden_states, *next_states
 +
 +    def load_weights(self, state_dict, state_dict_start_idx):
 +        fake_weights = state_dict is None
@@ -1108,30 +1106,39 @@ index 0000000..902f255
 +
 +    def get_example_inputs(self, num_token: int = 128, cache_size: int = 512, get_dym_shape=False):
 +        head_dim = int(self.head_dim)
++        state_rows = self.config.conv_L_cache - 1
++        conv_valid, conv_select = conv_inputs(num_token, 0, 0, state_rows)
 +        example_inputs = (
 +            torch.randn(1, num_token, self.config.hidden_size, device="cpu", dtype=torch.float32),
 +            torch.randn(1, 1, num_token, cache_size + num_token, device="cpu", dtype=torch.float32),
 +            torch.randn(1, 2, num_token, head_dim, device="cpu", dtype=torch.float32),
-+            *[
-+                torch.randn(
-+                    1,
-+                    self.config.num_key_value_heads,
-+                    cache_size,
-+                    head_dim,
-+                    device="cpu",
-+                    dtype=torch.float32,
-+                )
-+                for _ in range(2 * self.num_blocks)
-+            ],
++            conv_valid,
++            conv_select,
++            *[torch.randn(*shape, device="cpu", dtype=torch.float32) for shape in self.state_shapes(cache_size)],
 +        )
 +        if get_dym_shape:
 +            nt = Dim("num_token", max=num_token)
-+            cache_dims = tuple(({} for _ in range(2 * self.num_blocks)))
++            cache_dims = tuple(({} for _ in self.state_shapes(cache_size)))
 +            dynamic_shapes = (
 +                {0: Dim.STATIC, 1: nt, 2: Dim.STATIC},
 +                {0: Dim.STATIC, 1: Dim.STATIC, 2: nt, 3: nt + cache_size},
 +                {0: Dim.STATIC, 1: Dim.STATIC, 2: nt, 3: Dim.STATIC},
++                {0: Dim.STATIC, 1: nt, 2: Dim.STATIC},
++                {0: Dim.STATIC, 1: nt + state_rows, 2: Dim.STATIC},
 +                cache_dims,
 +            )
 +            return example_inputs, dynamic_shapes
 +        return example_inputs
++
++
++def conv_inputs(num_token, left_pad, right_pad, state_rows):
++    """The conv layers' padding inputs for a batch of num_token with the runner's padding: valid
++    marks the real tokens, select takes the last state_rows real positions of the state-padded
++    sequence, which for a right-padded batch are not its last positions."""
++    valid = torch.zeros(1, num_token, 1, dtype=torch.float32)
++    valid[0, left_pad : num_token - right_pad, 0] = 1.0
++    select = torch.zeros(1, num_token + state_rows, state_rows, dtype=torch.float32)
++    end = num_token - right_pad
++    for j in range(state_rows):
++        select[0, end + j, j] = 1.0
++    return valid, select
