@@ -383,6 +383,13 @@ def run(
     if precision not in PRECISIONS:
         raise ExportError(f"unknown NeuroPilot precision {precision!r}, expected one of {sorted(PRECISIONS)}")
     recipe = dataclasses.replace(recipe, precision=precision)
+    # The prompt graph's batch sets the size of its attention scores, which grow with the
+    # window (heads x batch x window per layer), so a smaller batch is a memory lever with a
+    # prefill cost; overridable to measure both.
+    prompt_tokens = int(os.environ.get("MTK_PROMPT_TOKENS") or recipe.prompt_tokens)
+    if prompt_tokens < 1:
+        raise ExportError(f"MTK_PROMPT_TOKENS must be positive, got {prompt_tokens}")
+    recipe = dataclasses.replace(recipe, prompt_tokens=prompt_tokens)
     if context is not None:
         if context < recipe.prompt_tokens:
             raise ExportError(f"--context {context} is below the prompt length {recipe.prompt_tokens}")

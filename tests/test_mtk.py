@@ -118,6 +118,16 @@ def test_the_precision_comes_from_the_environment_and_only_as_a_name_mediatek_kn
     assert "-neuropilot-a16w8-4k-" in naming.mtk_chunk_file("Qwen/Qwen3-0.6B", "A16W8", 4096, 0, 4)
 
 
+def test_the_prompt_batch_comes_from_the_environment_and_must_be_positive(tmp_path, monkeypatch):
+    monkeypatch.setenv("MTK_PROMPT_TOKENS", "0")
+    with pytest.raises(export_mtk.ExportError, match="MTK_PROMPT_TOKENS must be positive"):
+        export_mtk.run("Qwen/Qwen3-0.6B", "main", "MT6991", tmp_path, tmp_path, "p", tmp_path)
+    # A window below the batch is still refused against the batch actually used.
+    monkeypatch.setenv("MTK_PROMPT_TOKENS", "64")
+    with pytest.raises(export_mtk.ExportError, match="below the prompt length 64"):
+        export_mtk.run("Qwen/Qwen3-0.6B", "main", "MT6991", tmp_path, tmp_path, "p", tmp_path, context=32)
+
+
 def mtk_report(soc="mt6991"):
     chunks = [f"mtk/{soc}/Qwen3-0.6B-neuropilot-a16w4-2k-chunk{i}of4.pte" for i in range(1, 5)]
     embedding = f"mtk/{soc}/Qwen3-0.6B-neuropilot-embedding-fp32.bin"
