@@ -57,10 +57,10 @@ index 6c00bbb..9d5fa24 100644
                      from aot_utils.llm_utils.tokenizers_.tokenization_whisper import (
 diff --git a/examples/mediatek/model_export_scripts/lfm2.py b/examples/mediatek/model_export_scripts/lfm2.py
 new file mode 100644
-index 0000000..6c24e05
+index 0000000..0d8fc8f
 --- /dev/null
 +++ b/examples/mediatek/model_export_scripts/lfm2.py
-@@ -0,0 +1,511 @@
+@@ -0,0 +1,513 @@
 +# Copyright (c) MediaTek Inc.
 +# All rights reserved
 +#
@@ -126,11 +126,13 @@ index 0000000..6c24e05
 +
 +
 +def _retry_compile_service_start():
-+    """MediaTek's compiler client starts a local service on a random port per compile, and
-+    that start sometimes fails ("Failed to start the compilation service on port N"): two of
-+    eight CI jobs on 2026-09-24, each after hours of work, never on the same chunk twice.
-+    The compile is a pure function of its input, so it is simply asked again; any other
-+    error, or a third failure, still stops the export."""
++    """MediaTek's compiler client starts a local service on a random port per compile and
++    polls it over HTTP, and on 2026-09-24 that failed in three of eleven CI jobs, each after
++    hours of work, on chunks 2, 3 and 2: twice "Failed to start the compilation service on
++    port N", once the connection reset mid-compile and the client raised the service's own
++    "Starting service at port: N". The compile is a pure function of its input, so it is
++    asked again; any error that is not about the service, or a third failure, still stops
++    the export."""
 +    try:
 +        import mtk_neuron
 +    except ImportError:
@@ -144,7 +146,7 @@ index 0000000..6c24e05
 +            try:
 +                return compile_once(*args, **kwargs)
 +            except RuntimeError as error:
-+                if "compilation service" not in str(error) or attempt == 2:
++                if "service" not in str(error) or attempt == 2:
 +                    raise
 +                print(f"mtk_neuron: {error}; asking again ({attempt + 2} of 3)")
 +                time.sleep(10)

@@ -40,3 +40,29 @@ LFM2.5-1.2B-Instruct (revision 0f604ada), MediaTek export graph, 2026-09-24.
            deadlocked on memory")
 
    About 0.47 MB per window position whatever the precision.
+
+4. The corrected export on the phone (A16W8, runner with the openweights llama_runner patch).
+   NPU memory is the growth of the system DMA-BUF total in `dumpsys meminfo` while the runner
+   holds a build (the fall in MemAvailable is that plus the runner's ~0.35 GB).
+
+   build                                    512       4k        MB per window position
+   old layout, batch 128                    1.89 GB   3.84 GB   0.54 to 0.58
+   per-layer states, batch 128              1.79 GB             0.40 (512 to 2k)
+   + regrouped attention, batch 128         1.82 GB   3.19 GB   0.38
+   + regrouped attention, batch 64          1.62 GB   2.59 GB   0.27
+   + regrouped attention, batch 32          1.52 GB   2.33 GB   0.23
+
+   8k at batch 128: 4.50 GB. 16k at batch 128 was stopped by a guard (kill the runner below
+   1 GB MemAvailable) at 5.6 GB used and climbing.
+
+   Twelve short questions against the fp32 original's greedy replies, three needles, and
+   fidelity (tokens of the original's 64 greedy tokens reproduced before the first divergence,
+   ten long prompts):
+
+   build                           correct  identical  needles  fidelity median / mean
+   old layout 2k                   11/12    7/12       3/3      10 / 11.4
+   per-layer states 2k             12/12    12/12      3/3      30.5 / 37.0
+   + regrouped attention 2k        12/12    12/12      3/3      51.5 / 44.3
+   old layout 4k                   11/12    7/12       3/3      6 / 6.4
+   + regrouped attention 4k        12/12    12/12      3/3      33.5 / 34.9
+   + regrouped attention 8k        12/12    12/12      3/3
