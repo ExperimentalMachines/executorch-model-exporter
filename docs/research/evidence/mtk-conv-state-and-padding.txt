@@ -1,0 +1,42 @@
+LFM2.5-1.2B-Instruct (revision 0f604ada), MediaTek export graph, 2026-09-24.
+
+1. The runner's padding against Hugging Face, no quantization.
+   mtk-conv-state-and-padding.py: a Python replica of LlamaRuntime::Run and LlamaModelChunk
+   (first feed of a fresh cache left-padded with token 0, later feeds right-padded and the
+   caches rolled back, fp32 masks 0 / -100 with padded rows fully masked, rotary rows for pads
+   at zero) driving the export's own chunk modules, scored against transformers 4.57.6 fp32
+   on f2048_0: a 1,670-token passage from PG19 book 25773 (not in the calibration corpus) and
+   24 steps of the original's greedy continuation, teacher-forced. KL(original || export)
+   per step.
+
+   layout  mode    what feeds the prompt                          argmax  KL mean   KL max
+   old     exact   no padding, each feed at its own length         24/24   1.4e-08   2.3e-07
+   old     runner  shell runner: 6-token remainder left-padded     23/24   0.204     1.159
+   old     pieces  app: two feeds, the second right-padded         23/24   0.204     1.139
+   new     exact   no padding                                      24/24   1.4e-08   2.3e-07
+   new     runner  shell runner                                    24/24   1.4e-08   2.3e-07
+   new     pieces  app                                             24/24   1.4e-08   2.3e-07
+
+   "exact" is the rig check: MediaTek's graph equals Hugging Face when nothing is padded.
+
+2. The same with A16W8 quantize-dequantize graphs (prepare_pt2e, calibrate_streaming on
+   MediaTek's alpaca prompts, convert_pt2e), shell runner feed:
+
+   old     runner                                                  23/24   0.165     0.789
+   new     runner                                                  23/24   0.0024    0.0086
+
+   For scale, finding 35's A16W8 without any padding: KL 0.0068 over 3,999 positions at 4k.
+
+3. Runner memory on the phone (Poco X8 Pro Max, MT6991, 11.5 GB), old layout: the fall in
+   MemAvailable while mtk_llama_executor_runner held one build, lowest reading at 0.3 s.
+
+   window  A16W8   A16W4
+   512     2.1 GB  1.7 GB
+   2k      3.1 GB
+   4k      4.1 GB  3.9 GB
+   8k      5.9 GB  6.4 GB
+   16k     phone rebooted (A16W8: reboot,hang_detect, free 40 MB, NPU dma-buf pool
+           unreclaimable; A16W4 the day before: "Kernel panic - not syncing: System is
+           deadlocked on memory")
+
+   About 0.47 MB per window position whatever the precision.
