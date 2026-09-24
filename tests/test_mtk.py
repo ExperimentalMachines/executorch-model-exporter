@@ -362,8 +362,9 @@ def test_lfm2_conv_layers_carry_their_own_state_and_the_padding_inputs():
     modeling = text[text.index("modeling_lfm2.py b/") :]
     added = [line[1:] for line in modeling.splitlines() if line.startswith("+")]
     script = text[text.index("model_export_scripts/lfm2.py b/") : text.index("configuration_lfm2.py b/")]
-    assert export_mtk.PER_LAYER_STATE_MARKER in modeling
-    assert "from models.llm_models.modeling_lfm2 import conv_inputs" in script
+    # The export checks the script for the marker before it runs it, as run() reads it.
+    assert export_mtk.PER_LAYER_STATE_MARKER in script
+    assert "def state_shapes(" in modeling and "def conv_inputs(" in modeling
     # The export checks for the marker; the conv layer takes its own state, the valid mask and
     # the selector, and no longer rides a K cache.
     assert any("def forward(self, hidden_states, conv_valid, conv_select, conv_state):" in line for line in added)

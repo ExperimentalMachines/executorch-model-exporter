@@ -103,7 +103,8 @@ STREAMING_SCRIPTS = frozenset({"lfm2.py"})
 # 36). States go in layer order, one per conv layer, a K and a V per attention layer. MediaTek's
 # stock runner cannot load that; the one in the openweights app tells caches from states by
 # shape. The runner block records which layout a file has, so a host can tell before loading.
-PER_LAYER_STATE_MARKER = "def state_shapes("
+# The script imports the padding inputs from the model file that defines the new layout.
+PER_LAYER_STATE_MARKER = "from models.llm_models.modeling_lfm2 import conv_inputs"
 PER_LAYER_STATE_SCRIPTS = frozenset({"lfm2.py"})
 
 
