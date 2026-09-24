@@ -674,10 +674,10 @@ index 0000000..53074a1
 +            print()
 diff --git a/examples/mediatek/models/llm_models/modeling_lfm2.py b/examples/mediatek/models/llm_models/modeling_lfm2.py
 new file mode 100644
-index 0000000..7f66c87
+index 0000000..2a37d52
 --- /dev/null
 +++ b/examples/mediatek/models/llm_models/modeling_lfm2.py
-@@ -0,0 +1,464 @@
+@@ -0,0 +1,515 @@
 +# Copyright (c) MediaTek Inc.
 +# All rights reserved
 +#
@@ -696,13 +696,60 @@ index 0000000..7f66c87
 +torch.manual_seed(42)
 +
 +
++class Lfm2Attention(Attention):
++    """MediaTek's Attention with the grouped-query product taken by regrouping the queries,
++    not by repeating K and V.
++
++    repeat_kv copies each K and V head to every query head that reads it: two (1, heads,
++    cache + t, head_dim) tensors per layer, four times the cache they come from, in both the
++    prompt and the generation graph. Viewing the queries as (1, kv_heads, groups * t, head_dim)
++    pairs every query head with its K/V head directly (query head h reads K/V head
++    h // groups, as repeat_kv arranges them), so the product is the same and nothing is
++    copied. The mask arrives repeated to groups * t rows, once per chunk.
++    """
++
++    def forward(self, hidden_states, mask, pos_emb, past_key, past_value):
++        bsz, q_len, _ = hidden_states.size()
++        query_states = (
++            self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
++        )
++        key_states = (
++            self.k_proj(hidden_states)
++            .view(bsz, q_len, self.num_key_value_heads, self.head_dim)
++            .transpose(1, 2)
++        )
++        value_states = (
++            self.v_proj(hidden_states)
++            .view(bsz, q_len, self.num_key_value_heads, self.head_dim)
++            .transpose(1, 2)
++        )
++        if self.config.use_qk_norm:
++            query_states = self.apply_q_norm(query_states)
++            key_states = self.apply_k_norm(key_states)
++        cos, sin = torch.split(pos_emb, 1, dim=1)
++        query_states, key_states = self.apply_rotary_pos_emb_mtk(query_states, key_states, cos, sin)
++
++        key_states = torch.cat([past_key, key_states], dim=2)
++        value_states = torch.cat([past_value, value_states], dim=2)
++        groups = self.num_key_value_groups
++        query_states = query_states.reshape(bsz, self.num_key_value_heads, groups * q_len, self.head_dim)
++        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / self.attn_scale
++        attn_weights = attn_weights + mask
++        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
++        attn_output = torch.matmul(attn_weights, value_states)
++        attn_output = attn_output.reshape(bsz, self.num_heads, q_len, self.head_dim).transpose(1, 2)
++        attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
++        attn_output = self.o_proj(attn_output)
++        return attn_output, key_states[:, :, q_len:, :], value_states[:, :, q_len:, :]
++
++
 +class Lfm2AttentionLayer(nn.Module):
 +    def __init__(self, config: Lfm2Config, jit_trace=False):
 +        super().__init__()
 +        self.config = config
 +        self.jit_trace = jit_trace
 +        self.input_norm = RMSNorm(config.hidden_size, eps=config.norm_eps).float()
-+        self.self_attn = Attention(config, jit_trace=jit_trace)
++        self.self_attn = Lfm2Attention(config, jit_trace=jit_trace)
 +        self.post_attention_norm = RMSNorm(config.hidden_size, eps=config.norm_eps).float()
 +        self.mlp = MLP(config)
 +
@@ -855,6 +902,10 @@ index 0000000..7f66c87
 +        hidden_states = inputs_embeds
 +        next_states = []
 +        cursor = 0
++        # The attention layers take their queries grouped by K/V head (Lfm2Attention), so the
++        # mask is repeated to match, once for the chunk rather than once per layer.
++        groups = self.config.num_attention_heads // self.config.num_key_value_heads
++        mask = mask.repeat(1, 1, groups, 1)
 +        for idx, layer in enumerate(self.layers):
 +            layer_device = self.device_list[idx] if self.device_list else hidden_states.device
 +            if self.layer_types[idx] == "conv":

@@ -369,6 +369,8 @@ def test_lfm2_conv_layers_carry_their_own_state_and_the_padding_inputs():
     # the selector, and no longer rides a K cache.
     assert any("def forward(self, hidden_states, conv_valid, conv_select, conv_state):" in line for line in added)
     assert not any("past_key[:, :, :8, :]" in line for line in added)
+    # Grouped-query attention by regrouping the queries: no K/V copied four times per layer.
+    assert "class Lfm2Attention(Attention):" in modeling
     assert export_mtk.state_layout("lfm2.py") == "per-layer"
     # Qwen keeps MediaTek's uniform caches, which the stock runner reads.
     assert export_mtk.state_layout(plan().script) == "uniform"
